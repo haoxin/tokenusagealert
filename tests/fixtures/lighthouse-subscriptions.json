@@ -1,0 +1,14 @@
+[
+  {
+    "subscriptionId": "5b643b3a-b486-4197-b5a0-e7eb33e33657",
+    "displayName": "Pay-As-You-Go-TEMP",
+    "tenantId": "92078590-b3a5-4c46-aaea-74360df451d0",
+    "state": "Enabled"
+  },
+  {
+    "subscriptionId": "6ce33da7-9e41-4e48-8a95-c48f1bde120a",
+    "displayName": "mct",
+    "tenantId": "92078590-b3a5-4c46-aaea-74360df451d0",
+    "state": "Enabled"
+  }
+]

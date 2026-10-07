@@ -1,0 +1,30 @@
+{
+  "name": "@tokenusagealert/web-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "lint": "tsc -b --noEmit",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@fluentui/react-charts": "9.3.27",
+    "@fluentui/react-components": "9.74.9",
+    "@fluentui/react-icons": "2.0.343",
+    "@tokenusagealert/schemas": "workspace:*",
+    "@tokenusagealert/ui": "workspace:*",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-router-dom": "7.18.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@vitejs/plugin-react": "6.1.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  }
+}

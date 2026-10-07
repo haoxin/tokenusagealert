@@ -1,0 +1,12 @@
+.git
+.azurite
+.azurite-e2e
+.env
+.env.*
+**/node_modules
+**/dist
+**/coverage
+**/test-results
+**/playwright-report
+**/*.parameters.local.json
+**/*.local.bicepparam

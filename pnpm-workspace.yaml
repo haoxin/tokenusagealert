@@ -1,0 +1,7 @@
+packages:
+  - apps/web/*
+  - apps/jobs/*
+  - packages/*
+allowBuilds:
+  esbuild: true
+  protobufjs: true

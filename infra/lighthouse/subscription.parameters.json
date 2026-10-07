@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "managedByTenantId": {
+      "value": "REPLACE_WITH_PARTNER_TENANT_ID"
+    },
+    "collectorPrincipalId": {
+      "value": "REPLACE_WITH_COLLECTOR_OBJECT_ID"
+    },
+    "offboardingPrincipalId": {
+      "value": "REPLACE_WITH_OFFBOARDING_OBJECT_ID"
+    },
+    "mspOfferName": {
+      "value": "AOAI Cost Usage Monitoring"
+    },
+    "mspOfferDescription": {
+      "value": "Azure OpenAI usage monitoring: read-only Collector plus a separate identity authorized to remove this service's Lighthouse delegation."
+    }
+  }
+}

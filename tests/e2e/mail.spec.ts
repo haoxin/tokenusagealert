@@ -1,0 +1,20 @@
+import { expect, test } from '@playwright/test'
+
+test('local preview saves notification settings and persists an unsent test event', async ({ page }) => {
+  await page.goto('/settings')
+  const settings = page.getByRole('region', { name: '告警邮件设置', exact: true })
+  await expect(settings).toContainText('费用恢复仅记录，不发送恢复邮件')
+  await expect(settings.getByRole('textbox', { name: '发件邮箱', exact: true })).toHaveValue('chx@ms-ext.biz')
+  await settings.getByLabel('统一运维收件人（每行一个）').fill('chx@ms-ext.biz')
+  await settings.getByRole('button', { name: '保存通知设置' }).click()
+  await expect(settings.getByRole('status')).toContainText('通知设置已保存')
+  await settings.getByRole('button', { name: '预览测试（不发送邮件）' }).click()
+  await expect(settings.getByRole('status')).toContainText('测试事件已入队')
+  await settings.getByRole('button', { name: '刷新测试状态' }).click()
+  await expect(settings.getByText('预览完成 · 未发信', { exact: true })).toBeVisible()
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name: '运行状态', exact: true }).click()
+  const outbox = page.getByRole('region', { name: '邮件 Outbox', exact: true })
+  await expect(outbox.locator('tbody tr').filter({ hasText: '发信验证' }).first()).toContainText('预览完成 · 未发信')
+  await page.reload()
+  await expect(outbox.locator('tbody tr').filter({ hasText: '发信验证' }).first()).toContainText('预览完成 · 未发信')
+})

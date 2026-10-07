@@ -2,9 +2,24 @@
 .env
 .env.*
 !.env.example
+infra/bicep/*.parameters.local.json
+infra/bicep/*.local.bicepparam
+infra/lighthouse/*.parameters.local.json
 
 # Logs
 *.log
+
+# Node workspaces
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Local Azure emulators
+.azurite/
+.azurite-e2e/
 
 # OS files
 .DS_Store

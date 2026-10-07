@@ -1,0 +1,19 @@
+using './main.bicep'
+
+param location = 'swedencentral'
+param namePrefix = 'aoai-cost-prod'
+param deployWebApp = false
+param containerImage = ''
+param storageAccessMode = 'private'
+// Only a new storage account may use an empty existing policy.
+param existingStorageLifecycleRules = []
+param mailSenderMailbox = 'alerts@partner.example'
+param mailAllowedRecipientDomains = ['partner.example']
+param mailAuthorizationReady = false
+param tags = {
+  application: 'tokenusagealert'
+  environment: 'prod'
+  owner: 'replace-me'
+  costCenter: 'replace-me'
+  dataClassification: 'internal'
+}

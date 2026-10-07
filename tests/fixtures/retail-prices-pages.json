@@ -1,0 +1,52 @@
+[
+  {
+    "BillingCurrency": "USD",
+    "Count": 1,
+    "NextPageLink": "https://prices.azure.com/api/retail/prices?$skip=1",
+    "Items": [
+      {
+        "currencyCode": "USD",
+        "type": "Consumption",
+        "meterId": "10000000-0000-4000-8000-000000000001",
+        "meterName": "gpt 4.1 Inp glbl Tokens",
+        "productId": "fixture-product",
+        "productName": "Azure OpenAI",
+        "skuId": "fixture-input",
+        "skuName": "gpt 4.1 Inp glbl",
+        "serviceName": "Foundry Models",
+        "armRegionName": "swedencentral",
+        "retailPrice": 0.002,
+        "unitPrice": 0.002,
+        "unitOfMeasure": "1K",
+        "tierMinimumUnits": 0,
+        "effectiveStartDate": "2026-01-01T00:00:00Z",
+        "isPrimaryMeterRegion": true
+      }
+    ]
+  },
+  {
+    "BillingCurrency": "USD",
+    "Count": 1,
+    "NextPageLink": null,
+    "Items": [
+      {
+        "currencyCode": "USD",
+        "type": "Consumption",
+        "meterId": "10000000-0000-4000-8000-000000000002",
+        "meterName": "gpt 4.1 Outp glbl Tokens",
+        "productId": "fixture-product",
+        "productName": "Azure OpenAI",
+        "skuId": "fixture-output",
+        "skuName": "gpt 4.1 Outp glbl",
+        "serviceName": "Foundry Models",
+        "armRegionName": "swedencentral",
+        "retailPrice": 0.008,
+        "unitPrice": 0.008,
+        "unitOfMeasure": "1K",
+        "tierMinimumUnits": 0,
+        "effectiveStartDate": "2026-01-01T00:00:00Z",
+        "isPrimaryMeterRegion": true
+      }
+    ]
+  }
+]

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.41.2.15936",
+      "templateHash": "14527435133850309967"
+    }
+  },
+  "parameters": {
+    "managedByTenantId": {
+      "type": "string",
+      "metadata": {
+        "description": "Microsoft Entra tenant ID of the AOAI Cost managing tenant."
+      }
+    },
+    "collectorPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the collector service principal in the managing tenant."
+      }
+    },
+    "offboardingPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object ID of the separate offboarding managed identity. Grants only registration-assignment deletion; the Collector remains Reader."
+      }
+    },
+    "mspOfferName": {
+      "type": "string",
+      "defaultValue": "AOAI Cost Usage Monitoring",
+      "metadata": {
+        "description": "Display name shown to the customer for this delegation."
+      }
+    },
+    "mspOfferDescription": {
+      "type": "string",
+      "defaultValue": "Read-only discovery and Azure Monitor metrics collection for Azure OpenAI cost estimation.",
+      "metadata": {
+        "description": "Description shown to the customer for this delegation."
+      }
+    }
+  },
+  "variables": {
+    "readerRoleDefinitionId": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+    "deleteAssignmentRoleDefinitionId": "91c1777a-f3dc-4fae-b103-61d183457e46",
+    "registrationDefinitionName": "[guid(parameters('managedByTenantId'), parameters('collectorPrincipalId'), subscription().subscriptionId, parameters('mspOfferName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedServices/registrationDefinitions",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('registrationDefinitionName')]",
+      "properties": {
+        "registrationDefinitionName": "[parameters('mspOfferName')]",
+        "description": "[parameters('mspOfferDescription')]",
+        "managedByTenantId": "[parameters('managedByTenantId')]",
+        "authorizations": [
+          {
+            "principalId": "[parameters('collectorPrincipalId')]",
+            "principalIdDisplayName": "AOAI Cost Collector",
+            "roleDefinitionId": "[variables('readerRoleDefinitionId')]"
+          },
+          {
+            "principalId": "[parameters('offboardingPrincipalId')]",
+            "principalIdDisplayName": "AOAI Cost Offboarding",
+            "roleDefinitionId": "[variables('deleteAssignmentRoleDefinitionId')]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.ManagedServices/registrationAssignments",
+      "apiVersion": "2022-10-01",
+      "name": "[guid(subscription().subscriptionId, variables('registrationDefinitionName'))]",
+      "properties": {
+        "registrationDefinitionId": "[subscriptionResourceId('Microsoft.ManagedServices/registrationDefinitions', variables('registrationDefinitionName'))]"
+      },
+      "dependsOn": [
+        "[subscriptionResourceId('Microsoft.ManagedServices/registrationDefinitions', variables('registrationDefinitionName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "registrationDefinitionId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.ManagedServices/registrationDefinitions', variables('registrationDefinitionName'))]"
+    },
+    "registrationAssignmentId": {
+      "type": "string",
+      "value": "[subscriptionResourceId('Microsoft.ManagedServices/registrationAssignments', guid(subscription().subscriptionId, variables('registrationDefinitionName')))]"
+    },
+    "delegatedSubscriptionId": {
+      "type": "string",
+      "value": "[subscription().subscriptionId]"
+    },
+    "offboardingIdentityObjectId": {
+      "type": "string",
+      "value": "[parameters('offboardingPrincipalId')]"
+    }
+  }
+}

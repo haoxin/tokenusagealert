@@ -1,0 +1,16 @@
+.mail-settings, .mail-operations, .mail-timeline { margin: 18px 0; }
+.mail-panel-body { padding: 18px; font-size: 12px; line-height: 1.65; }
+.mail-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin: 18px 0; }
+.mail-settings-grid p, .mail-note { color: #616161; }
+.mail-test { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; padding-top: 20px; margin-top: 20px; border-top: 1px solid #e1dfdd; }
+.mail-test > div:first-child { min-width: 240px; flex: 1; }
+.mail-event-id { overflow-wrap: anywhere; color: #616161; font-size: 11px; }
+.mail-timeline ol { margin: 0; padding-left: 24px; }
+.mail-timeline li { margin: 14px 0; padding: 4px 0 12px 8px; border-bottom: 1px solid #ededed; }
+.mail-timeline li p { margin: 4px 0; }
+.mail-timeline li small { color: #616161; }
+@media(max-width:720px) {
+  .mail-settings-grid { grid-template-columns: 1fr; }
+  .mail-test { flex-direction: column; align-items: stretch; }
+  .mail-test > div:first-child { min-width: 0; }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "tokenusagealert",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@12.6.0",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "dev": "pnpm build:packages && concurrently --kill-others --names storage,api,web --prefix-colors yellow,cyan,blue \"pnpm dev:storage\" \"pnpm dev:server\" \"pnpm dev:client\"",
+    "dev:storage": "azurite-blob --silent --skipApiVersionCheck --location .azurite --blobHost 127.0.0.1 --blobPort 10000",
+    "dev:server": "cross-env NODE_ENV=development AUTH_MODE=development DEV_AUTH_OBJECT_ID=00000000-0000-4000-8000-000000000001 DEV_AUTH_NAME=local.operator@ms-ext.biz AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true BLOB_AUTO_CREATE=true AUTH_SYNC_MODE=inline AUTH_SYNC_FIXTURE_PATH=../../../tests/fixtures/lighthouse-subscriptions.json PRICING_SYNC_MODE=fixture PRICING_FIXTURE_PATH=../../../tests/fixtures/retail-prices-pages.json USAGE_SYNC_MODE=fixture MAIL_MODE=preview PORT=3100 pnpm --filter @tokenusagealert/web-server dev",
+    "dev:client": "pnpm --filter @tokenusagealert/web-client dev",
+    "sync:authorization:fixture": "cross-env AUTH_DISCOVERY_MODE=fixture MANAGING_TENANT_ID=493da702-671c-450d-9d72-e51b74816e2d FIXTURE_SUBSCRIPTIONS_JSON='[]' AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true BLOB_AUTO_CREATE=true pnpm --filter @tokenusagealert/authorization-sync-job start",
+    "sync:pricing:fixture": "cross-env NODE_ENV=development PRICING_SOURCE=fixture PRICING_FIXTURE_PATH=tests/fixtures/retail-prices-pages.json AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true BLOB_AUTO_CREATE=true node apps/jobs/pricing-sync/dist/index.js",
+    "build:packages": "pnpm --filter @tokenusagealert/schemas build && pnpm --filter @tokenusagealert/domain build && pnpm --filter @tokenusagealert/ui build && pnpm --filter @tokenusagealert/azure build",
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "test:infra": "tsc -p infra/bicep/tsconfig.json && vitest run infra/bicep/tests",
+    "test:integration": "concurrently --kill-others --success command-test --names storage,test \"pnpm dev:storage\" \"wait-on tcp:127.0.0.1:10000 && pnpm --filter @tokenusagealert/azure test:integration\"",
+    "test:e2e": "pnpm build && node -e \"require('node:fs').rmSync('.azurite-e2e',{recursive:true,force:true})\" && concurrently --kill-others --success command-test --names storage,api,web,test \"azurite-blob --silent --skipApiVersionCheck --location .azurite-e2e --blobHost 127.0.0.1 --blobPort 10000\" \"wait-on tcp:127.0.0.1:10000 && cross-env NODE_ENV=development AUTH_MODE=development DEV_AUTH_OBJECT_ID=00000000-0000-4000-8000-000000000001 DEV_AUTH_NAME=local.operator@ms-ext.biz AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true BLOB_AUTO_CREATE=true AUTH_SYNC_MODE=inline AUTH_SYNC_FIXTURE_PATH=tests/fixtures/lighthouse-subscriptions.json PRICING_SYNC_MODE=fixture PRICING_FIXTURE_PATH=tests/fixtures/retail-prices-pages.json USAGE_SYNC_MODE=fixture MAIL_MODE=preview PORT=3100 node apps/web/server/dist/index.js\" \"pnpm dev:client\" \"wait-on tcp:127.0.0.1:10000 http://127.0.0.1:3100/health/live http://127.0.0.1:5173 && playwright test\"",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.13.3",
+    "azurite": "3.37.0",
+    "concurrently": "10.0.5",
+    "cross-env": "10.1.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.2",
+    "wait-on": "9.0.3"
+  }
+}

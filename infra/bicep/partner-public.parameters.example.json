@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "value": "swedencentral" },
+    "namePrefix": { "value": "aoai-partner" },
+    "storageAccessMode": { "value": "public" },
+    "deployWebApp": { "value": false },
+    "containerImage": { "value": "" },
+    "existingStorageLifecycleRules": { "value": [] },
+    "mailSenderMailbox": { "value": "alerts@partner.example" },
+    "mailAllowedRecipientDomains": { "value": ["partner.example"] },
+    "mailAuthorizationReady": { "value": false },
+    "usageShardCount": { "value": 1 },
+    "usageTenantConcurrency": { "value": 8 },
+    "usageSubscriptionConcurrency": { "value": 8 },
+    "usageRequestConcurrency": { "value": 32 },
+    "tags": {
+      "value": {
+        "application": "tokenusagealert",
+        "environment": "prod",
+        "owner": "replace-with-partner-operations",
+        "dataClassification": "internal"
+      }
+    }
+  }
+}

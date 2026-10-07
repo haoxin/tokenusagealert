@@ -1,0 +1,53 @@
+{
+  "name": "@tokenusagealert/azure",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./authorization": {
+      "types": "./dist/authorization.d.ts",
+      "import": "./dist/authorization.js"
+    },
+    "./pricing": {
+      "types": "./dist/pricing.d.ts",
+      "import": "./dist/pricing.js"
+    },
+    "./usage": {
+      "types": "./dist/usage.d.ts",
+      "import": "./dist/usage.js"
+    },
+    "./alerts": {
+      "types": "./dist/alerts.d.ts",
+      "import": "./dist/alerts.js"
+    },
+    "./offboarding": {
+      "types": "./dist/offboarding.d.ts",
+      "import": "./dist/offboarding.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run src --exclude '**/*.integration.test.ts' --passWithNoTests",
+    "test:integration": "vitest run src/index.integration.test.ts src/tenant-deletion.integration.test.ts src/tenant-settings.integration.test.ts src/pricing.integration.test.ts src/manual-pricing.integration.test.ts src/usage.integration.test.ts src/usage-repricing.integration.test.ts src/models-metric-cache.integration.test.ts src/mail.integration.test.ts src/offboarding.integration.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@azure/identity": "4.13.3",
+    "@azure/storage-blob": "12.34.0",
+    "@tokenusagealert/domain": "workspace:*",
+    "@tokenusagealert/schemas": "workspace:*",
+    "zod": "4.6.5",
+    "decimal.js": "10.6.0"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vitest": "5.0.2"
+  }
+}
