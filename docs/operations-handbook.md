@@ -1,6 +1,8 @@
 # Azure OpenAI 费用告警平台：管理员与客户操作手册
 
-适用于当前仓库和 `ms-ext` 测试实例，校准日期为 2026-10-07。第 1–6 批及后续通用
+适用于当前仓库和 `ms-ext` 测试实例；2026-11-06 缓存/priority 补充能力已上线，
+Web revision `0000021` Healthy、100% 流量，真实 Collector 已完成指标定义/空用量采集验证。
+这不表示已经做过新一轮非零 Priority/缓存调用测试。第 1–6 批及后续通用
 计价、手动缺价和 Models 指标迁移已纳入本文；生产加固仍未全部完成。
 本文说明操作步骤，不会自动执行授权或部署。
 新合作伙伴的独立安装使用 [合作伙伴安装与移交指南](partner-installation.md)；
@@ -383,6 +385,8 @@ az deployment sub create --subscription "$SUB" \
 | 授权同步 | 每小时第 10 分钟；可手动同步 |
 | 用量采集 | 每小时第 15 分钟，只查上一完整小时；如 13:15 查 12:00–13:00 |
 | 指标口径 | Models - Usage：`InputTokens` / `OutputTokens`；按部署、模型、版本拆分 |
+| 实际服务档位 | 支持时补充 `ServiceTierResponse` 分组，核对 Models 总量后计价；priority 请求降级按实际响应档位 |
+| 缓存观测 | OpenAI 为小时平均命中率，不是 cached token 数；Anthropic 的专属读写/TTL 计数单独保留 |
 | 资源发现 | 每 2 小时刷新清单；新增资源可能需等待，旧小时不默认补采 |
 | 结果确认 | 新小时为“暂定” `provisional`；不随时间自动变成“已确认” `final` |
 | 价格同步 | 北京时间每日 00:00，校验后自动更新，无人工复核 |
@@ -397,8 +401,16 @@ az deployment sub create --subscription "$SUB" \
 - 当前官方价格目录仍仅 Azure OpenAI，未增加 Grok 等 provider 的价格。其他 Foundry
   模型可保存用量，缺价明确显示“—”；之后按实际模型/版本/SKU 加手动价格。
 - Models token 指标没有实际服务档位时可能出现更宽估算区间；不能无证据认为所有调用
-  都用 Standard。单独的 Estimated Cost Preview 不用作正式费用主源。
+  都用 Standard。新采集器优先核对 OpenAI 补充指标的实际响应档位；补充失败/不一致
+  会显示问题，不把两组 token 相加，也不以请求的 priority 档位猜价。
+  单独的 Estimated Cost Preview 不用作正式费用主源。
 - 金额是 USD 公开零售价估算，不是实际账单；缓存输入按普通输入价保守估算。
+- **缓存精度限制**：`AzureOpenAIContextTokensCacheMatchRate` 是 Percent/Average，
+  不是精确缓存量；即便显示 80%，也不能用小时输入 token × 80% 抵扣费用。OpenAI
+  精确缓存量需要响应级 `cached_tokens/cache_write_tokens`，当前没有该数据源。
+  租户详情“缓存与实际服务档位”会区分百分比、Anthropic 专属计数、无观测和读取失败。
+  `CACHE_BILLING_UNVERIFIED` 表示缓存计费协议/TTL 仍未确认，不能把小计当作完整费用。
+  官方指标和边界见 [技术设计 3.5.1](technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06)。
 - **默认精简价格下载**：`aoai-pricing.json` 是内部计算实际使用的官方精简目录，加上
   已登记的手动备用规则。统一 USD／100 万 token，包含模型、SKU、区域、上下文、
   服务档位、输入/输出/缓存方向、最新已生效日期和真实 meter ID；不提前用未来价。

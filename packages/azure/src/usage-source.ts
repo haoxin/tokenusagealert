@@ -6,6 +6,7 @@ import { UsageExecutionSettingsSchema } from '@tokenusagealert/schemas'
 import type {
   DeploymentInventory, ResourceInventory, SubscriptionInventoryDocument,
   TokenObservation, UsageIssue, UsageExecutionSettings, TokenBillingSlice,
+  BillingMetricCapabilities,
 } from '@tokenusagealert/schemas'
 
 export interface UsageWindow { windowStartUtc: string; windowEndUtc: string }
@@ -59,6 +60,7 @@ const definitionSchema = z.object({
     name: z.object({ value: z.string() }),
     dimensions: z.array(z.object({ value: z.string() })).optional(),
     supportedAggregationTypes: z.array(z.string()).optional(),
+    unit: z.string().optional(),
   }).passthrough()),
 })
 const metricsSchema = z.object({
@@ -73,11 +75,17 @@ const metricsSchema = z.object({
       data: z.array(z.object({
         timeStamp: z.iso.datetime({ offset: true }),
         total: z.number().finite().nonnegative().refine(Number.isSafeInteger).nullish(),
+        average: z.number().finite().nonnegative().nullish(),
       })),
     })),
   })),
 })
 const requiredMetrics = ['InputTokens', 'OutputTokens'] as const
+const tierMetrics = ['ProcessedPromptTokens', 'GeneratedTokens'] as const
+const cacheRateMetric = 'AzureOpenAIContextTokensCacheMatchRate'
+const cacheTokenMetrics = ['cacheReadInputTokens', 'ephemeral5mInputTokens', 'ephemeral1hInputTokens'] as const
+const billingMetricNames = [...requiredMetrics, ...tierMetrics, cacheRateMetric, ...cacheTokenMetrics]
+const identityDimensions = ['ModelDeploymentName', 'ModelName', 'ModelVersion']
 const accountType = 'Microsoft.CognitiveServices/accounts'
 const TOP_SERIES = 10000
 
@@ -270,10 +278,14 @@ export class ArmUsageSource implements UsageSource {
               }
               accountDeployments = next
             }
-            const dimensions = cached && account.modelsMetricDimensions ? account.modelsMetricDimensions
-              : await this.metricDimensions(account.id, signal)
+            const capabilities = cached && account.modelsMetricDimensions && account.billingMetricCapabilities
+              ? { dimensions: account.modelsMetricDimensions, billing: account.billingMetricCapabilities }
+              : await this.metricCapabilities(account.id, signal)
+            const dimensions = capabilities.dimensions
             account.modelsMetricDimensions = dimensions
+            account.billingMetricCapabilities = capabilities.billing
             const points = await this.observeAccount(account.id, accountDeployments, window, dimensions, signal)
+            await this.enrichBilling(account.id, accountDeployments, points, window, capabilities.billing, dimensions, signal)
             observations.push(...points)
             if (points.some((item) => item.issues.some((issue) => issue.code === 'DEPLOYMENT_METADATA_CHANGED'))) cacheHealthy = false
           } catch (error) {
@@ -322,7 +334,7 @@ export class ArmUsageSource implements UsageSource {
     return { inventory, observations, successfulSubscriptions }
   }
 
-  private async metricDimensions(accountId: string, signal: AbortSignal): Promise<string[]> {
+  private async metricCapabilities(accountId: string, signal: AbortSignal) {
     const definitions = definitionSchema.parse(await this.get(
       `${accountId}/providers/microsoft.insights/metricDefinitions?api-version=2018-01-01`, signal,
     ))
@@ -331,35 +343,49 @@ export class ArmUsageSource implements UsageSource {
       .some((name) => !item?.dimensions?.some((dimension) => dimension.value === name)))) {
       throw new UsageReadError('METRIC_DEFINITION_MISSING', '缺少 Models InputTokens/OutputTokens 或部署/模型/版本维度；不会静默切回旧指标或补零。')
     }
-    return ['ModelDeploymentName', 'ModelVersion', 'ModelName', 'Region', 'ApiName',
+    const dimensions = ['ModelDeploymentName', 'ModelVersion', 'ModelName', 'Region', 'ApiName',
       'ServiceTierRequest', 'ServiceTierResponse', 'ContextLength', 'ContextType', 'Modality', 'TokenType']
       .filter((name) => relevant.every((item) => item?.dimensions?.some((dimension) => dimension.value === name)))
+    const billing: BillingMetricCapabilities = {
+      version: 1,
+      definitions: definitions.value.filter((item) => billingMetricNames.includes(item.name.value)).map((item) => ({
+        name: item.name.value, dimensions: item.dimensions?.map((dimension) => dimension.value) ?? [],
+        unit: item.unit ?? null, aggregations: item.supportedAggregationTypes ?? [],
+      })),
+    }
+    return { dimensions, billing }
   }
 
-  private async observeAccount(accountId: string, deployments: DeploymentInventory[], window: UsageWindow, dimensions: string[], signal: AbortSignal): Promise<TokenObservation[]> {
+  private async queryMetrics(accountId: string, names: readonly string[], aggregation: 'Total' | 'Average',
+    window: UsageWindow, dimensions: string[], signal: AbortSignal) {
     const url = new URL(`https://management.azure.com${accountId}/providers/microsoft.insights/metrics`)
     url.searchParams.set('api-version', '2023-10-01')
     url.searchParams.set('metricnamespace', accountType)
-    url.searchParams.set('metricnames', requiredMetrics.join(','))
-    url.searchParams.set('aggregation', 'Total')
+    url.searchParams.set('metricnames', names.join(','))
+    url.searchParams.set('aggregation', aggregation)
     url.searchParams.set('interval', 'PT1H')
     url.searchParams.set('timespan', `${window.windowStartUtc}/${window.windowEndUtc}`)
     url.searchParams.set('ValidateDimensions', 'true')
     url.searchParams.set('AutoAdjustTimegrain', 'false')
     url.searchParams.set('top', String(TOP_SERIES))
     url.searchParams.set('$filter', dimensions.map((name) => `${name} eq '*'`).join(' and '))
-    const metrics = metricsSchema.parse(await this.get(url.href, signal))
+    return metricsSchema.parse(await this.get(url.href, signal))
+  }
+
+  private async observeAccount(accountId: string, deployments: DeploymentInventory[], window: UsageWindow, dimensions: string[], signal: AbortSignal): Promise<TokenObservation[]> {
+    const metrics = await this.queryMetrics(accountId, requiredMetrics, 'Total', window, dimensions, signal)
     return this.observationsForWindow(metrics, deployments, window)
   }
 
-  private observationsForWindow(metrics: z.infer<typeof metricsSchema>, deployments: DeploymentInventory[], window: UsageWindow): TokenObservation[] {
+  private observationsForWindow(metrics: z.infer<typeof metricsSchema>, deployments: DeploymentInventory[], window: UsageWindow,
+    family: 'models' | 'tier' = 'models'): TokenObservation[] {
     const results = new Map(deployments.map((deployment) => [deployment.name, {
       deployment, input: 0n, output: 0n, points: 0,
       verified: !deployment.deleted && Date.parse(deployment.firstObservedAtUtc) <= Date.parse(window.windowStartUtc),
       issues: [] as UsageIssue[],
       slices: [] as TokenBillingSlice[],
     }]))
-    for (const metricName of requiredMetrics) {
+    for (const [direction, metricName] of (family === 'models' ? requiredMetrics : tierMetrics).entries()) {
       const metric = metrics.value.find((item) => item.name.value === metricName)
       if (!metric || (metric.errorCode && metric.errorCode !== 'Success') || (metric.unit && metric.unit !== 'Count')) {
         throw new UsageReadError('METRIC_QUERY_FAILED', `指标 ${metricName} 未成功返回。`)
@@ -375,14 +401,14 @@ export class ArmUsageSource implements UsageSource {
           Date.parse(point.timeStamp) >= Date.parse(window.windowStartUtc) &&
           Date.parse(point.timeStamp) < Date.parse(window.windowEndUtc))
         const count = validPoints.reduce((sum, point) => sum + BigInt(point.total!), 0n)
-        if (metricName === 'InputTokens') result.input += count
+        if (direction === 0) result.input += count
         else result.output += count
         result.points += validPoints.length
         const context = (metadata.get('contexttype') ?? metadata.get('contextlength') ?? '').toLowerCase().replace(/[-_ ]/g, '')
         const modality = (metadata.get('modality') ?? metadata.get('tokentype') ?? '').toLowerCase()
-        const tier = (metadata.get('servicetierresponse') ?? metadata.get('servicetierrequest') ?? '').toLowerCase()
+        const tier = (metadata.get('servicetierresponse') ?? '').toLowerCase()
         result.slices.push({
-          direction: metricName === 'InputTokens' ? 'input' : 'output', tokens: count.toString(),
+          direction: direction === 0 ? 'input' : 'output', tokens: count.toString(),
           context: ['short', 'shortco', 'shortcontext', 'shco'].includes(context) ? 'short'
             : ['long', 'longco', 'longcontext', 'loco'].includes(context) ? 'long' : null,
           modality: ['text', 'audio', 'image', 'video'].includes(modality)
@@ -392,7 +418,8 @@ export class ArmUsageSource implements UsageSource {
         })
         if (count > 0n) {
           const model = metadata.get('modelname')
-          if (metadata.get('modelversion') !== result.deployment.modelVersion || model !== result.deployment.modelName) {
+          if (metadata.get('modelversion') !== result.deployment.modelVersion ||
+            (family === 'models' ? model !== result.deployment.modelName : model !== undefined && model !== result.deployment.modelName)) {
             result.verified = false
             result.issues.push({ code: 'DEPLOYMENT_METADATA_CHANGED', message: '指标中的模型/版本与缓存清单不同，下一轮提前刷新，不套用旧价格。', resourceId: result.deployment.id })
           }
@@ -410,6 +437,128 @@ export class ArmUsageSource implements UsageSource {
       billingSlices: result.slices,
       metricFamily: this.metricFamily,
     }))
+  }
+
+  private async enrichBilling(accountId: string, deployments: DeploymentInventory[], observations: TokenObservation[],
+    window: UsageWindow, capabilities: BillingMetricCapabilities, dimensions: string[], signal: AbortSignal) {
+    const definition = (name: string, required: string[], unit: string, aggregation: string) =>
+      capabilities.definitions.find((item) => item.name === name &&
+        required.every((dimension) => item.dimensions.includes(dimension)) &&
+        (item.unit === null || item.unit === unit) &&
+        (item.aggregations.length === 0 || item.aggregations.includes(aggregation)))
+    const openai = observations.filter((item) => item.deployment.modelFormat?.toLowerCase() === 'openai')
+    const anthropic = observations.filter((item) => item.deployment.modelFormat?.toLowerCase() === 'anthropic')
+    for (const item of observations) item.billingTelemetry = {
+      tierSource: dimensions.includes('ServiceTierResponse') &&
+        item.billingSlices?.some((slice) => BigInt(slice.tokens) > 0n) &&
+        item.billingSlices.every((slice) => slice.tier !== null) ? 'models' : 'unknown',
+      cache: { source: item.deployment.modelFormat?.toLowerCase() === 'anthropic' ? 'anthropic-cache-tokens' : 'unavailable',
+        status: 'unsupported', matchRatePercent: null,
+        readTokens: null, write5mTokens: null, write1hTokens: null },
+    }
+    const guarded = async (rows: TokenObservation[], code: string, message: string, work: () => Promise<void>, cache = false) => {
+      try { await work() }
+      catch (error) {
+        signal.throwIfAborted()
+        const detail = error instanceof UsageReadError ? ` ${error.code}: ${error.message}` : ''
+        for (const item of rows) {
+          item.issues.push({ code, message: `${message}${detail}`, resourceId: item.deployment.id })
+          if (cache) item.billingTelemetry!.cache.status = 'failed'
+        }
+      }
+    }
+    const tasks: Promise<void>[] = []
+    const tierDefinitions = tierMetrics.map((name) =>
+      definition(name, ['ModelDeploymentName', 'ModelVersion', 'ServiceTierResponse'], 'Count', 'Total'))
+    const tierRows = openai.filter((item) => item.billingTelemetry!.tierSource === 'unknown' &&
+      !item.deployment.sku?.includes('Batch'))
+    if (tierRows.length && tierDefinitions.every((item) => item !== undefined)) {
+      tasks.push(guarded(tierRows, 'SERVICE_TIER_QUERY_FAILED', '实际服务档位补充读取失败；保留 Models 总量和档位不确定估算。', async () => {
+        const split = ['ModelDeploymentName', 'ModelVersion', 'ModelName', 'ApiName', 'Region', 'ServiceTierResponse',
+          'ContextLength', 'ContextType', 'Modality', 'TokenType']
+          .filter((name) => tierDefinitions.every((item) => item!.dimensions.includes(name)))
+        const metrics = await this.queryMetrics(accountId, tierMetrics, 'Total', window, split, signal)
+        const supplemental = this.observationsForWindow(metrics, deployments, window, 'tier')
+        for (const item of tierRows) {
+          const other = supplemental.find((row) => row.deployment.id === item.deployment.id)!
+          if (other.inputTokens !== item.inputTokens || other.outputTokens !== item.outputTokens ||
+            !other.metadataVerified || other.issues.length) {
+            item.issues.push({ code: 'SERVICE_TIER_TOTAL_MISMATCH',
+              message: '实际服务档位指标与 Models 同小时模型/版本或输入输出总量不一致；未相加或覆盖，保留档位不确定估算。',
+              resourceId: item.deployment.id })
+          } else if (other.billingSlices?.length && other.billingSlices.every((slice) => slice.tier !== null)) {
+            item.billingSlices = other.billingSlices
+            item.billingTelemetry!.tierSource = 'azure-openai-usage'
+          } else if (BigInt(item.inputTokens ?? '0') + BigInt(item.outputTokens ?? '0') > 0n) {
+            item.issues.push({ code: 'SERVICE_TIER_RESPONSE_MISSING',
+              message: '补充指标未给出实际响应档位，不以请求档位推断费用。', resourceId: item.deployment.id })
+          }
+        }
+      }))
+    }
+    const rateDefinition = definition(cacheRateMetric, identityDimensions, 'Percent', 'Average')
+    if (openai.length && rateDefinition) {
+      for (const item of openai) item.billingTelemetry!.cache.source = 'openai-cache-match-rate'
+      tasks.push(guarded(openai, 'CACHE_METRIC_QUERY_FAILED', '缓存命中率读取失败；未转换为缓存 token 数或补零。', async () => {
+        const metrics = await this.queryMetrics(accountId, [cacheRateMetric], 'Average', window, identityDimensions, signal)
+        const values = this.supplementalValues(metrics, cacheRateMetric, deployments, window, 'Percent', 'average')
+        for (const item of openai) {
+          const value = values.get(item.deployment.name)
+          item.billingTelemetry!.cache.matchRatePercent = value === undefined ? null : String(value)
+          item.billingTelemetry!.cache.status = value === undefined ? 'noData' : 'available'
+        }
+      }, true))
+    }
+    const cacheDefinitions = cacheTokenMetrics.map((name) => definition(name, identityDimensions, 'Count', 'Total'))
+    const cacheNames = cacheTokenMetrics.filter((_, index) => cacheDefinitions[index] !== undefined)
+    if (anthropic.length && cacheNames.length) {
+      for (const item of anthropic) item.billingTelemetry!.cache.source = 'anthropic-cache-tokens'
+      tasks.push(guarded(anthropic, 'CACHE_METRIC_QUERY_FAILED', 'Anthropic 缓存读写计数读取失败；缺失不作为零费用。', async () => {
+        const metrics = await this.queryMetrics(accountId, cacheNames, 'Total', window, identityDimensions, signal)
+        const values = new Map(cacheNames.map((name) => [name,
+          this.supplementalValues(metrics, name, deployments, window, 'Count', 'total')]))
+        for (const item of anthropic) {
+          const cache = item.billingTelemetry!.cache
+          const read = values.get('cacheReadInputTokens')?.get(item.deployment.name)
+          const write5m = values.get('ephemeral5mInputTokens')?.get(item.deployment.name)
+          const write1h = values.get('ephemeral1hInputTokens')?.get(item.deployment.name)
+          cache.readTokens = read === undefined ? null : String(read)
+          cache.write5mTokens = write5m === undefined ? null : String(write5m)
+          cache.write1hTokens = write1h === undefined ? null : String(write1h)
+          cache.status = [read, write5m, write1h].some((value) => value !== undefined) ? 'available' : 'noData'
+        }
+      }, true))
+    }
+    await Promise.all(tasks)
+  }
+
+  private supplementalValues(metrics: z.infer<typeof metricsSchema>, name: string, deployments: DeploymentInventory[],
+    window: UsageWindow, unit: 'Count' | 'Percent', aggregation: 'total' | 'average') {
+    const metric = metrics.value.find((item) => item.name.value === name)
+    if (!metric || (metric.errorCode && metric.errorCode !== 'Success') || (metric.unit && metric.unit !== unit)) {
+      throw new UsageReadError('CACHE_METRIC_INVALID', `缓存指标 ${name} 失败或单位不符。`)
+    }
+    if (metric.timeseries.length >= TOP_SERIES) throw new UsageReadError('METRICS_TRUNCATED', '缓存指标达到序列上限。')
+    const values = new Map<string, number>()
+    for (const series of metric.timeseries) {
+      const metadata = new Map(series.metadatavalues?.map((item) => [item.name.value.toLowerCase(), item.value]) ?? [])
+      const deployment = deployments.find((item) => item.name === metadata.get('modeldeploymentname'))
+      if (!deployment || metadata.get('modelname') !== deployment.modelName ||
+        metadata.get('modelversion') !== deployment.modelVersion || deployment.deleted) {
+        throw new UsageReadError('CACHE_METRIC_IDENTITY_MISMATCH', '缓存指标部署/模型/版本与当前清单不一致。')
+      }
+      const points = series.data.filter((point) => point[aggregation] !== null && point[aggregation] !== undefined &&
+        Date.parse(point.timeStamp) >= Date.parse(window.windowStartUtc) && Date.parse(point.timeStamp) < Date.parse(window.windowEndUtc))
+      if (points.length > 1 || (points.length && values.has(deployment.name))) {
+        throw new UsageReadError('CACHE_METRIC_DUPLICATE', '缓存指标分组或小时数据重复，未在应用中合并平均值。')
+      }
+      if (points.length) {
+        const value = points[0]![aggregation]!
+        if (unit === 'Percent' && value > 100) throw new UsageReadError('CACHE_RATE_INVALID', '缓存命中率必须在 0 到 100 之间。')
+        values.set(deployment.name, value)
+      }
+    }
+    return values
   }
 
   private issue(error: unknown, resourceId: string): UsageIssue {

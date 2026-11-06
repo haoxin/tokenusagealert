@@ -17,7 +17,11 @@ describe('separate Models dimension-cache persistence', () => {
       accounts: [{ id: '/mock/account', name: 'mock', kind: 'AIServices', region: 'swedencentral',
         subscriptionId: '22222222-2222-4222-8222-222222222222',
         metricDimensions: ['ModelDeploymentName', 'FeatureName', 'ModelVersion'],
-        modelsMetricDimensions: ['ModelDeploymentName', 'ModelName', 'ModelVersion'] }],
+        modelsMetricDimensions: ['ModelDeploymentName', 'ModelName', 'ModelVersion'],
+        billingMetricCapabilities: { version: 1, definitions: [{
+          name: 'AzureOpenAIContextTokensCacheMatchRate', dimensions: ['ModelDeploymentName', 'ModelName', 'ModelVersion'],
+          unit: 'Percent', aggregations: ['Average'],
+        }] } }],
       deployments: [], issues: [], subscriptionDiscovery: [],
     }
     try {
@@ -27,9 +31,11 @@ describe('separate Models dimension-cache persistence', () => {
       const baseline = JSON.parse((await container.getBlobClient(`tenants/${tenantId}/resources.json`).downloadToBuffer()).toString())
       expect(baseline.accounts[0].metricDimensions).toBeUndefined()
       expect(baseline.accounts[0].modelsMetricDimensions).toBeUndefined()
+      expect(baseline.accounts[0].billingMetricCapabilities).toBeUndefined()
       const cache = JSON.parse((await container.getBlobClient(`tenants/${tenantId}/resource-cache.json`).downloadToBuffer()).toString())
       expect(cache.metricDimensions['/mock/account']).toEqual(inventory.accounts[0]!.metricDimensions)
       expect(cache.modelsMetricDimensions['/mock/account']).toEqual(inventory.accounts[0]!.modelsMetricDimensions)
+      expect(cache.billingMetricCapabilities['/mock/account']).toEqual(inventory.accounts[0]!.billingMetricCapabilities)
     } finally { await Promise.all(Object.values(names).map((name) => client.getContainerClient(name).delete())) }
   })
 })

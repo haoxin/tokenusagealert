@@ -53,7 +53,7 @@ export function UsageNotice() {
     <Info20Regular aria-hidden="true" />
     <div>
       <strong>Models - Usage 采集 · USD 零售价估算</strong>
-      <span>新采集统一使用 InputTokens/OutputTokens，按部署、模型、版本区分；官方价格目录仍为 Azure OpenAI，其他模型无价时保留用量、金额不补零，可之后补手动价。上下文、服务档位等维度不足显示估算区间，不是实际账单。</span>
+      <span>总量使用 InputTokens/OutputTokens；实际档位补充指标必须与总量核对后才用于计价。缓存命中率不是精确缓存 token，不折算折扣；缺失不填零。官方目录仍仅 Azure OpenAI，条件不足显示估算区间，不是实际账单。</span>
     </div>
   </div>
 }

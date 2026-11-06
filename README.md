@@ -11,7 +11,7 @@ Token usage monitoring and alerting.
 - [RPI implementation plan (Chinese)](docs/rpi-implementation-plan.md)
 - [Infrastructure and deployment reference](infra/bicep/README.md)
 
-## Current implementation baseline (2026-10-07)
+## Current implementation baseline (2026-11-06)
 
 - Container Apps Web plus Authorization, Usage, Pricing and Mail Jobs, private
   Blob JSON, and Lighthouse delegation for multiple customers/subscriptions.
@@ -20,6 +20,11 @@ Token usage monitoring and alerting.
   the existing test instance is unchanged. See the installation guide above.
 - Models - Usage `InputTokens/OutputTokens`, one completed hour per collection,
   a two-hour discovery cache, and no default historical backfill or automatic finality.
+- Deployed update (2026-11-06): capability-driven OpenAI served-tier
+  supplements are used only after exact parity with Models totals. Priority uses
+  **ServiceTierResponse**, never the requested tier. Cache-hit **Percent** is
+  observational, not an exact cached-token discount; provider-specific Anthropic
+  counters are retained without assuming OpenAI cache billing semantics.
 - Compact v2 is the actual pricing lookup source. Official prices remain
   Azure OpenAI-only; manual text-token rules fill genuine gaps, never override
   applicable official rates. Generic token rules support new names with the same
@@ -29,7 +34,7 @@ Token usage monitoring and alerting.
   unsubmitted recovery mail are suppressed. Breach/reminder subjects and body
   summaries include the USD estimate/range. Data-quality notifications are unchanged.
   A durable Outbox preserves outcomes; Graph acceptance is not proof of delivery.
-- Current documented release is Web revision `0000020`; see the mail-policy release
+- Current documented release is Web revision `0000021`; see the cached/priority release
   record below. Production hardening (batch 7) is not fully delivered.
 
 The slice/release sections below preserve historical rollout and test evidence.
@@ -37,6 +42,45 @@ Their old revision numbers, model restrictions and preview states do not overrid
 this baseline or the [current implementation matrix](docs/rpi-implementation-plan.md#61-当前实现基线).
 The design, implementation plan and operational/deployment guidance were aligned
 to source schemas, routes and templates on the baseline date.
+
+### Cached and priority token support
+
+The existing USD/hour alerts include verified priority-tier costs. Generic Models
+totals stay authoritative; `ProcessedPromptTokens/GeneratedTokens` are supplemental
+actual-tier splits, not extra tokens. Unsupported or inconsistent splits remain
+explicitly uncertain.
+
+Microsoft documents `AzureOpenAIContextTokensCacheMatchRate` as **Percent/Average**,
+not an exact OpenAI PAYG cached-token counter. Do not multiply that average by hourly
+tokens to claim a discount. Exact `cached_tokens/cache_write_tokens` are response-level
+usage and require a separate data source. Anthropic-only cache metrics are collected
+when advertised; unverified provider/TTL billing stays partial with unknown upper cost.
+
+See the [metric contract and official sources](docs/technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06)
+and [reader-first upgrade guidance](docs/partner-installation.md#缓存与-priority-的指标限制2026-11-06-源码更新).
+The existing instance now runs this update; it does not claim an exact cached-token bill.
+
+### Cached/priority release verification (2026-11-06)
+
+Web revision **`aoai-cost-test-web--0000021`** is Healthy with 100% traffic.
+Web/Usage/Mail use immutable image
+`sha256:e2e89796ecde48f2afe3a8c3151688a2866d4af62461a43a5a47f41a88bdebda`
+(ACR `dtr`). The compatible Web/API reader was updated before Collector.
+Pricing and Authorization Jobs retain their existing compatible images.
+
+Real Collector-identity execution `aoai-cost-test-usage-ekh7iua` succeeded.
+Its live metric definitions include `ServiceTierResponse` on both legacy token
+counters and Percent/Average for `AzureOpenAIContextTokensCacheMatchRate`.
+The persisted 10:00–11:00 Beijing hour includes new `billingTelemetry`, no issues,
+and zero observed input/output. Empty cache observations remain null/noData:
+this proves the real collection path, not a positive priority/cache traffic test.
+
+Workspace lint/types/build and **342** tests, eight infrastructure contracts,
+focused Blob/history/mail and browser checks passed. Private readback confirmed
+unchanged prices, tenant/mail/manual settings and retained historical records;
+normal Mail execution succeeded with no error. Only images changed: no full
+infrastructure apply, network/RBAC/schedule mutation, inference or synthetic email.
+Detailed API and worked calculations are in [technical design 3.5.2](docs/technical-design.md#352-api-读取priority-数量与费用计算示例).
 
 ## First vertical slice
 

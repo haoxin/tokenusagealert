@@ -5,6 +5,7 @@
 > 历史批次说明保留当时事实；后续规划不得用于推断当前 API、文件或安全控制已经存在。
 > 邮件策略更新（2026-10-07）：费用恢复仅保留状态/事件，不发恢复邮件；超限及持续提醒的标题和正文均包含估算金额。
 > 合作伙伴移交（2026-10-07）：新增明确选择的公网 HTTPS Blob/Consumption 安装 profile，原私网默认和当前实例不变；见 [安装指南](partner-installation.md)。
+> 指标补充（2026-11-06）：实际响应档位核对、OpenAI 缓存命中率及 Anthropic 专属缓存计数已上线当前实例，Web revision `0000021`。Collector 身份已实读指标定义及空用量窗口；没有据此声称已验证新正用量或 OpenAI PAYG 精确 cached-token 费用。
 
 ### 当前实现与源码索引
 
@@ -508,7 +509,8 @@ metrics 为：
 
 查询规则：
 
-- 每轮只查一个已完成 UTC 自然小时，固定 `PT1H`、`Total`，不默认回补多小时；
+- 每轮只查一个已完成 UTC 自然小时，token 用 `PT1H`、`Total`；缓存命中率用同窗口
+  `PT1H`、`Average`，不默认回补多小时；
 - 必须具备 `ModelDeploymentName`、`ModelName`、`ModelVersion`，并在可用时保留 `Region`、
   `ServiceTierRequest` 和 `ServiceTierResponse`；
 - 部署的 model name、version、SKU 和 location 以 ARM deployment metadata 为主，
@@ -517,13 +519,18 @@ metrics 为：
 - metric API 成功且所有受支持部署均返回空/零时，才允许把租户该小时记为 0；
 - API 失败、缺少必要维度或有未关联 deployment 时，结果必须为 `partial` 或 `failed`。
 
-旧 `ProcessedPromptTokens/GeneratedTokens` 只保留为历史来源，不静默回退。新小时及明细
-持久化 `metricFamily=models-usage`；已有历史 JSON 不重写。新的
+旧 `ProcessedPromptTokens/GeneratedTokens` 不再作为主总量，也不静默回退；2026-11-06
+起仅可作为 OpenAI 实际响应档位的补充计数。新小时及明细持久化
+`metricFamily=models-usage`；已有历史 JSON 不重写。新的
 `modelsMetricDimensions` 与旧维度缓存分开，不把 `FeatureName/UsageChannel` 用于新
 Input/Output 查询，也不为切换指标而破坏两小时资源发现缓存。
 
-Models token 指标通常没有实际服务档位维度；这时不得无条件套 Standard。根据既有可
-适用的单价显示服务档位估算区间，维度明确时仍精确匹配。此次不扩大 Retail Prices
+Models token 指标通常没有实际服务档位维度。运行时若旧 token 指标明确支持
+`ServiceTierResponse`，则读取同一小时、逐部署核对输入/输出总量、模型版本及元数据，
+通过后用其档位分组**替换计费分组，不累加 token 总量**。priority 请求被降级到
+default 时按标准价格；不能用 `ServiceTierRequest` 代替实际响应档位。
+不支持、读取失败或总量不一致时保留 Models 总量和档位不确定估算，失败/不一致有明确
+问题代码，不能无条件套 Standard。此次不扩大 Retail Prices
 查询范围，不加入其他 provider 单价；Foundry/Grok 等用量可读取，无价金额显示“—”，
 之后可由用户加入手动估算规则。`FoundryModelEstimatedCost` Preview 不是费用计算主源。
 
@@ -586,6 +593,151 @@ input 可能具有更低单价。第一阶段采用明确的保守策略：
 - GUI/邮件显示零售价估算、上下界及理由，不是实际账单上下界；未知缓存写入纳入上限，
   已知写入替换对应普通 input，不重复收费；
 - 后续若 Azure 指标提供稳定的 cache 维度，可通过计量适配器增加精确规则。
+
+#### 3.5.1 官网核实的缓存/priority 指标与当前边界（2026-11-06）
+
+| 用途 | 官方 REST 名称 / 维度 | 单位/聚合 | 当前实现与限制 |
+| --- | --- | --- | --- |
+| Models 主输入/输出 | `InputTokens` / `OutputTokens` | Count / Total | 主总量不变，不与补充指标相加 |
+| OpenAI 实际 priority 档位 | `ProcessedPromptTokens` / `GeneratedTokens` 的 `ServiceTierResponse` | Count / Total | 能力发现支持且同小时总量核对通过后，用实际档位匹配现有 priority/standard/flex 单价 |
+| OpenAI 缓存命中率 | `AzureOpenAIContextTokensCacheMatchRate` | Percent / Average | 查询部署/模型/版本分组；保留 Azure 返回的小时平均百分比，不乘小时 token 推算精确缓存量 |
+| Anthropic 缓存读取 | `cacheReadInputTokens` | Count / Total | 只对 Anthropic format 保存独立数量，不当作通用 OpenAI 缓存指标 |
+| Anthropic 缓存写入 | `ephemeral5mInputTokens` / `ephemeral1hInputTokens` | Count / Total | 保留 5 分钟/1 小时 TTL 的各自计数，不并入未经确认的 OpenAI 写入扣减公式 |
+| PTU Active Tokens | `ActiveTokens` | Count | 官网限定 PTU/PTU-managed；本按量计价不拿它反推 PAYG 缓存量 |
+
+没有名为通用 `PriorityTokens` 的独立计价指标；priority 是处理档位。官网仍把
+OpenAI 精确缓存读取/写入数量放在模型响应的 `cached_tokens/cache_write_tokens`；
+现有平台不收集请求响应，因此**不能提供 OpenAI PAYG 精确缓存折扣费用**。
+命中率是平均百分比，不能在应用里相加或再次平均不同序列；重复分组/小时点、
+错误单位、模型版本不一致或序列截断都会报错，空值保持未知。
+
+小时明细可选 `billingTelemetry` 保存档位来源、缓存来源/状态、百分比和 provider 专属
+计数，旧记录没有这些字段不等于零缓存。独立 `billingMetricCapabilities.version=1`
+缓存记录每个指标的维度/单位/聚合，仍复用两小时发现周期；baseline inventory 去掉该缓存
+字段以保留原结构。补充 API 失败不抹掉主输入/输出，而是保留问题与不完整状态。
+
+Anthropic 缓存计数存在、缺失或无法确认 TTL 费用时，现有单价/计量规则不冒称已经完整
+适配：保留可知小计、上限未知并标记 `CACHE_BILLING_UNVERIFIED`；即便主输入/输出为 0，
+缓存独有用量也不能变成完整零费用。该改动不新增 Anthropic 或其他 provider 官方价格。
+现有租户 USD/小时阈值包含已匹配的 priority 费用；不是新加独立 token 数阈值。
+费用恢复不发邮件的策略不变。
+
+官方依据（核对日期 2026-11-06）：
+[监控指标参考](https://learn.microsoft.com/azure/foundry/openai/monitor-openai-reference)、
+[资源指标清单](https://learn.microsoft.com/azure/azure-monitor/reference/supported-metrics/microsoft-cognitiveservices-accounts-metrics)、
+[Priority processing（含降级计费）](https://learn.microsoft.com/azure/foundry/openai/concepts/priority-processing)、
+[Prompt caching（响应级用量）](https://learn.microsoft.com/azure/foundry/openai/how-to/prompt-caching)。
+
+#### 3.5.2 API 读取、Priority 数量与费用计算示例
+
+以下请求和**非零数字**为格式/计算示例，不是当前租户的实测用量。2026-11-06 上线后，
+已通过实际 Collector 托管身份读取指标定义，确认旧 token 指标具有 `ServiceTierResponse`，
+缓存命中率是 Percent/Average；正常采集成功并保存新字段。该实测窗口没有模型用量，
+不能当作非零 Priority/缓存折扣的端到端验收。此前被拒绝的是当前 CLI 用户身份，
+不是已经验证成功的 Collector 身份；模拟与真实验证范围必须分开。
+
+**API 与身份。**Collector 使用自己的托管身份取得 ARM 令牌，经客户 Lighthouse
+Reader 授权读取 Azure Monitor，不调用模型推理 API，也不读取 prompts。首先查询：
+
+```http
+GET https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.CognitiveServices/accounts/{accountName}/providers/Microsoft.Insights/metricDefinitions?api-version=2018-01-01
+```
+
+只有运行时定义具有所需指标、维度、单位和聚合时，才查询对应补充指标。实际数据接口为
+[Azure Monitor Metrics - List](https://learn.microsoft.com/rest/api/monitor/metrics/list?view=rest-monitor-2023-10-01)：
+
+```http
+GET https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{resourceGroup}/providers/Microsoft.CognitiveServices/accounts/{accountName}/providers/Microsoft.Insights/metrics
+```
+
+以下是 Priority 补充查询的关键参数，实际程序负责 URL 编码；其他双方指标都支持的维度
+按运行时定义加入。这里查询北京时间 09:00–10:00 的完整小时：
+
+```text
+api-version=2023-10-01
+metricnamespace=Microsoft.CognitiveServices/accounts
+metricnames=ProcessedPromptTokens,GeneratedTokens
+aggregation=Total
+interval=PT1H
+timespan=2026-11-06T01:00:00Z/2026-11-06T02:00:00Z
+$filter=ModelDeploymentName eq '*' and ModelVersion eq '*' and ServiceTierResponse eq '*'
+ValidateDimensions=true
+AutoAdjustTimegrain=false
+top=10000
+```
+
+**数量来自返回值，不是按请求比例推算。**`ServiceTierResponse eq '*'` 让 Azure 按实际
+响应档位返回独立序列。程序从 `value[].name.value` 确认输入/输出指标，从
+`timeseries[].metadatavalues` 确认部署、版本和实际档位，再读取同小时 `data[].total`。
+例如下面是 `ProcessedPromptTokens` 中一个 Priority 序列的返回片段：
+
+```json
+{
+  "name": { "value": "ProcessedPromptTokens" },
+  "timeseries": [{
+    "metadatavalues": [
+      { "name": { "value": "ModelDeploymentName" }, "value": "chat-example" },
+      { "name": { "value": "ModelVersion" }, "value": "2026-01-01" },
+      { "name": { "value": "ServiceTierResponse" }, "value": "priority" }
+    ],
+    "data": [{ "timeStamp": "2026-11-06T01:00:00Z", "total": 40000 }]
+  }]
+}
+```
+
+对于同一部署/模型版本/小时：
+
+```text
+PriorityInputTokens  = sum(ProcessedPromptTokens 中 ServiceTierResponse=priority 的 total)
+PriorityOutputTokens = sum(GeneratedTokens 中 ServiceTierResponse=priority 的 total)
+```
+
+如果还按 API/区域拆了多个序列，按同一部署/版本/实际档位合计其数量；不相加百分比。
+所有档位的输入之和必须等于 Models `InputTokens`，输出之和必须等于 `OutputTokens`，
+且元数据核验通过，才能采用补充计费分组。两组指标描述同一批用量，不能再相加：
+
+| 同一小时的实际档位 | 输入 token | 输出 token |
+| --- | ---: | ---: |
+| Standard | 60,000 | 12,000 |
+| Priority | 40,000 | 8,000 |
+| 所有档位合计，应等于 Models 主总量 | 100,000 | 20,000 |
+
+**费用示例。**假设该模型 Standard 输入/输出为 USD 2/8 每百万 token，Priority 为
+USD 4/16 每百万 token，且没有其他上下文价位或缓存写入计费项。这里的单价是演示值，
+不是官网报价；实际按模型、版本、部署方式、区域和生效小时匹配价格。
+
+```text
+StandardEstimateUsd = 60000 / 1000000 * 2 + 12000 / 1000000 * 8 = 0.216
+PriorityEstimateUsd = 40000 / 1000000 * 4 +  8000 / 1000000 * 16 = 0.288
+TenantEstimateUsd   = 0.216 + 0.288 = 0.504
+```
+
+假设该租户只有上述用量、小时阈值为 USD 0.45，则当前估算口径触发一次超限事件。
+如果错误地全部套 Standard 单价，只会得到 USD 0.36，可能漏掉该估算告警。
+请求指定 priority 但响应实际为 default/standard 时，归入 Standard，而不是 Priority。
+
+**缓存怎么读，与上述数量有何关系。**缓存查询仍调用同一个 Metrics - List API：
+
+| 查询参数/返回字段 | OpenAI 命中率 | Anthropic 缓存读取 |
+| --- | --- | --- |
+| `metricnames` | `AzureOpenAIContextTokensCacheMatchRate` | `cacheReadInputTokens` |
+| `aggregation` / `interval` | `Average` / `PT1H` | `Total` / `PT1H` |
+| `data[]` 中读取的字段 | `average`，单位 Percent | `total`，单位 Count |
+| 例如读到的值 | `60` 表示小时平均 60% | `7000` 表示对应模型缓存读取 7,000 token |
+| 适用范围 | OpenAI，按实际能力发现确认 | Anthropic 专属，不能用于 OpenAI |
+
+OpenAI 命中率仅按部署/模型/版本分组，没有 `ServiceTierResponse` 维度。因此不能把
+上面的 Priority 输入 40,000 × 60% 当成 24,000 个 Priority cached token。百分比也不是
+精确 token 数；即便知道整个部署的缓存比例，仍不知道 Standard/Priority 各自缓存多少。
+
+当前 OpenAI `PriorityInputTokens` 是**未进行缓存拆分的输入计数**，不是已确认全部未命中
+缓存的数量。代码不获取或估算其中精确 cached/uncached 数量，费用暂不扣无法确认的
+缓存折扣；这可能高于实际账单。准确拆分需要另行接入每次响应的实际 `service_tier`、
+输入总量、`cached_tokens` 和适用的缓存写入数量，并验证相应计价规则。
+
+如果指标不存在、读取失败、返回不一致，程序明确标记未知/问题并保留主总量，不凭空
+计算 Priority 数量或补缓存零值。请求构造和分组核对的源码依据为
+[usage-source.ts](../packages/azure/src/usage-source.ts) 的 `queryMetrics/enrichBilling/observationsForWindow`。
 
 ### 3.6 每日价格同步
 
@@ -1316,6 +1468,8 @@ API 使用 `/api/v1` 前缀，主要端点如下：
 - `complete`、`partial`、`failed` 使用颜色加图标/纹理区分。
 - 支持查看某小时的 subscription、resource、deployment 费用明细。
 - 显示保守 cached-input 策略、价格快照、覆盖率和错误。
+- 展示实际服务档位输入/输出 token 及核对来源、缓存命中率/专属读写计数或明确的
+  不支持/无观测/读取失败。百分比不显示为缓存 token，旧历史不补出不存在的数量。
 - 告警时间线展示首次超限、提醒、恢复和数据质量事件。
 
 #### 租户与授权

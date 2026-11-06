@@ -29,6 +29,30 @@ function hour() {
 }
 
 describe('usage hourly storage and shard coordination', () => {
+  it('round-trips optional cache and actual-tier telemetry without changing counts or captured amounts', async () => {
+    const f = await fixture()
+    try {
+      const value = HourlyUsageSchema.parse({
+        ...hour(), activity: 'hasUsage', estimatedCostUsd: '35.2', knownCostUsd: '35.2', knownCostUpperUsd: '35.2',
+        inputTokens: '1000000', outputTokens: '2000000', pricingRuleVersion: 3, estimatePolicy: 'model-independent-retail-range',
+        coverage: { expectedSubscriptions: 1, successfulSubscriptions: 1, accounts: 1,
+          expectedDeployments: 1, successfulDeployments: 1, pricedDeployments: 1 },
+        breakdown: [{
+          deployment: { id: '/mock/deployments/chat', subscriptionId: '00000000-0000-4000-8000-000000000002',
+            accountId: '/mock', accountName: 'mock', accountKind: 'OpenAI', region: 'swedencentral', name: 'chat',
+            modelName: 'gpt-fixture', modelVersion: '2026-01-01', modelFormat: 'OpenAI', sku: 'GlobalStandard',
+            firstObservedAtUtc: '2026-01-01T00:00:00Z', observedAtUtc: new Date().toISOString(), deleted: false },
+          inputTokens: '1000000', outputTokens: '2000000', metricsStatus: 'success', metadataVerified: true, issues: [],
+          costUsd: '35.2', costUpperUsd: '35.2', prices: [], pricingStatus: 'matched', metricFamily: 'models-usage',
+          billingTelemetry: { tierSource: 'azure-openai-usage', cache: { source: 'openai-cache-match-rate',
+            status: 'available', matchRatePercent: '42.5', readTokens: null, write5mTokens: null, write1hTokens: null } },
+        }],
+      })
+      await f.store.saveHour(value, signal())
+      expect(await f.store.hours(tenantId, 24)).toEqual([value])
+    } finally { await f.cleanup() }
+  })
+
   it('upserts the same hour without duplicating cost or retroactively changing its threshold', async () => {
     const f = await fixture()
     try {

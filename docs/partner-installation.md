@@ -454,6 +454,26 @@ token 备用规则。官方价格优先，手动价不覆盖适用官方价。�
 
 更多规则和保留边界见 [技术设计](technical-design.md)。
 
+### 缓存与 priority 的指标限制（2026-11-06 源码更新）
+
+- OpenAI priority 不是独立 token 指标，而是 `ServiceTierResponse`；新采集器用
+  `ProcessedPromptTokens/GeneratedTokens` 的响应档位分组补充 Models，逐部署核对同小时
+  输入/输出总量后才计价。不按请求档位猜价，不重复计数。
+- OpenAI 缓存命中率是 Percent/Average，并非精确 cached token 数；当前不以该百分比抵扣
+  费用，缓存读取仍用普通输入价保守估算。响应级精确缓存量不在本平台的 Monitor 采集源中。
+- Anthropic 的 `cacheReadInputTokens/ephemeral5mInputTokens/ephemeral1hInputTokens`
+  只保存适用 provider 的独立数量。没有验证相应单价/TTL 费用前仍为部分估算，不新增官方价格。
+- 补充能力由运行时 metricDefinitions 确认。标准 Lighthouse Reader 包含所需的管理面读取；
+  403 不能通过扩大角色或添加存储密钥来绕过。
+- 新小时明细有可选 `billingTelemetry`。**先部署兼容 Web/API reader，再升级 Usage
+  Collector**；旧版严格 schema reader 不能保证读取新字段。既有历史不自动改写。
+  当前 `ms-ext` 实例已于 2026-11-06 按 reader-first 顺序上线至 revision `0000021`，
+  并通过实际 Collector 的指标定义/空用量验证；没有制造付费流量。合作伙伴自己的环境
+  仍须按第 9 节单独审批升级，不能从原实例上线推断其他环境已经发布。
+
+官方依据与完整状态说明见
+[缓存/档位指标设计](technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06)。
+
 ## 9. 升级、回滚与移交边界
 
 ### 升级

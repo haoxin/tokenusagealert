@@ -315,6 +315,73 @@ describe('safe historical repricing and threshold envelopes', () => {
     expect(() => repriceMissingUsageHour(before, other)).toThrow(/original official/)
   })
 
+  it('uses served priority token prices in the same existing hourly cost alert', () => {
+    const value = book([
+      meter(51, '9 Orion Inp Gl', 2), meter(52, '9 Orion Opt Gl', 7),
+      meter(53, '9 Orion Inp Priority Gl', 6), meter(54, '9 Orion Opt Priority Gl', 21),
+    ])
+    const item = observation()
+    item.metricFamily = 'models-usage'
+    item.billingSlices = [
+      { direction: 'input', tokens: '400000', tier: 'standard', context: null, modality: null },
+      { direction: 'input', tokens: '600000', tier: 'priority', context: null, modality: null },
+      { direction: 'output', tokens: '800000', tier: 'standard', context: null, modality: null },
+      { direction: 'output', tokens: '1200000', tier: 'priority', context: null, modality: null },
+    ]
+    const costs = calculateDeploymentCost(item, value, window)
+    expect(costs).toMatchObject({ costUsd: '35.200000000000', costUpperUsd: '35.200000000000', pricingStatus: 'matched' })
+    expect(evaluateAlertHour(initialAlertState(), {
+      ...hour(), knownCostUsd: costs.costUsd, knownCostUpperUsd: costs.costUpperUsd, thresholdUsd: '20', status: 'complete',
+    }, null, true).kinds).toEqual(['cost-exceeded'])
+    const downgraded = calculateDeploymentCost({
+      ...item, billingSlices: item.billingSlices.map((slice) => ({ ...slice, tier: 'standard' })),
+    }, value, window)
+    expect(downgraded.costUsd).toBe('16.000000000000')
+    expect(evaluateAlertHour(initialAlertState(), {
+      ...hour(), knownCostUsd: downgraded.costUsd, thresholdUsd: '20', status: 'complete',
+    }, null, true).kinds).toEqual([])
+  })
+
+  it('does not silently assume standard when Models has totals but no slices', () => {
+    const value = book([
+      meter(55, '9 Orion Inp Gl', 2), meter(56, '9 Orion Opt Gl', 7),
+      meter(57, '9 Orion Inp Priority Gl', 6), meter(58, '9 Orion Opt Priority Gl', 21),
+    ])
+    expect(calculateDeploymentCost({ ...observation(), metricFamily: 'models-usage' }, value, window)).toMatchObject({
+      costUsd: '16.000000000000', costUpperUsd: '48.000000000000', pricingStatus: 'range', pricingUncertainty: ['tier'],
+    })
+  })
+
+  it('retains the conservative cache-read estimate instead of multiplying an average percentage by tokens', () => {
+    const item: TokenObservation = { ...observation(), billingTelemetry: {
+      tierSource: 'unknown', cache: { source: 'openai-cache-match-rate', status: 'available', matchRatePercent: '99',
+        readTokens: null, write5mTokens: null, write1hTokens: null },
+    } }
+    const result = calculateDeploymentCost(item, contextBook(), window)
+    expect(result.costUsd).toBe('16.000000000000')
+    expect(result.prices.some((price) => price.direction === 'cacheWrite')).toBe(false)
+    expect(result.billingTelemetry).toEqual(item.billingTelemetry)
+    const before = hour()
+    before.breakdown[0]!.billingTelemetry = item.billingTelemetry
+    expect(repriceMissingUsageHour(before, contextBook(), now).breakdown[0]!.billingTelemetry).toEqual(item.billingTelemetry)
+  })
+
+  it.each([['60', '4', '6'], [null, null, null]] as const)(
+    'does not claim complete zero cost for unpriced Anthropic cache-only or unavailable usage %s', (readTokens, write5mTokens, write1hTokens) => {
+      const item: TokenObservation = { ...observation(), inputTokens: '0', outputTokens: '0', metricsStatus: 'noData',
+        billingTelemetry: { tierSource: 'unknown', cache: { source: 'anthropic-cache-tokens',
+          status: readTokens === null ? 'noData' : 'available', matchRatePercent: null, readTokens, write5mTokens, write1hTokens } } }
+      item.deployment.modelFormat = 'Anthropic'
+      const result = calculateDeploymentCost(item, contextBook(), window)
+      expect(result.issues.some((issue) => issue.code === 'CACHE_BILLING_UNVERIFIED')).toBe(true)
+      expect(result.costUpperUsd).toBeNull()
+      const summary = summarizeUsageCosts([result], result.issues, 1, 1, false)
+      expect(summary.status).toBe('partial')
+      expect(summary.estimatedCostUsd).toBeNull()
+      expect(summary.activity).toBe(readTokens === null ? 'unknown' : 'hasUsage')
+    },
+  )
+
   it('alerts only when the estimate lower bound exceeds the threshold and recovers only when the complete upper bound is below it', () => {
     const before = initialAlertState()
     const ranged = { ...hour(), knownCostUsd: '0.90', knownCostUpperUsd: '1.50', status: 'complete' as const }

@@ -1,6 +1,6 @@
 # Azure OpenAI 用量费用告警平台 RPI 实施计划
 
-> 2026-10-06 按代码/部署模板校准，2026-10-07 更新邮件策略。第 1–6 批及第 7–17 节补充为交付历史，
+> 2026-10-06 按代码/部署模板校准，2026-11-06 更新缓存/priority 上线记录。第 1–6 批及第 7–18 节补充为交付历史，
 > 后续用户批准的需求已经覆盖部分最初范围；当前能力以第 6.1 节为准。
 > 第七批生产加固/Marketplace 等仍为计划，不从一个健康测试 revision 推断已经完成。
 > 2026-10-07 邮件策略：费用恢复只记录，不投递；超限/持续提醒的标题和正文均包含 USD 估算金额。
@@ -231,14 +231,14 @@ infra/
 | 基础设施 | Consumption Web + 四类 Job、Blob JSON、ACR MI pull；private 默认，新增明确选择的 public/MI 新安装模板 | public 为模板级验证，未替合作伙伴真实部署；生产加固/完整恢复验收未完成，无 AKS/数据库/Key Vault 模块 | [main](../infra/bicep/main.bicep)、[安装指南](partner-installation.md) |
 | 登录 | Easy Auth + 显式开发身份；已获准用户同等业务权限 | app 创建、secret 保管和用户/组分配须管理员；无 Admin/Viewer 应用权限分层 | [身份解析](../apps/web/server/src/auth.ts)、[配置脚本](../infra/bicep/scripts/configure-entra-auth.ps1) |
 | 授权/租户 | Lighthouse、多客户多订阅、预登记可选、发现后显式启用、独立解除、归档/重新授权 | pending 无委派登记可硬删除；没有通用停用/任意软删除 API | [租户 API](../apps/web/server/src/app.ts)、[仓储](../packages/azure/src/index.ts) |
-| 指标/缓存 | Models InputTokens/OutputTokens，按部署/模型/版本，精确一小时 PT1H；资源发现 2 小时，分开新旧维度缓存 | 无默认历史回补、自动 final、请求级内容/用户审计；inventory 无版本时间线 | [Source](../packages/azure/src/usage-source.ts)、[存储](../packages/azure/src/usage-store.ts) |
+| 指标/缓存 | Models 主总量、同小时实际响应档位核对、OpenAI 缓存命中率、Anthropic 专属缓存数量；资源发现仍 2 小时 | 2026-11-06 已上线并验证定义/空用量；新正用量未另测。OpenAI PAYG 无精确缓存计数，不用百分比抵扣 | [Source](../packages/azure/src/usage-source.ts)、[指标边界](technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06) |
 | 价格/计价 | 官方仅 Azure OpenAI/USD，parser 3、compact v2、手动文本 token 缺价；通用无模型白名单、区间估算 | 非 OpenAI 官方价格未自动接入；图片数/秒数/容量/训练等缺计量不盲算 | [price filter](../packages/azure/src/pricing-source.ts)、[schemas](../packages/schemas/src/price-book.ts)、[计价](../packages/domain/src/usage.ts) |
 | 历史/补算 | 查询 1–240 小时、原阈值保留；受控单小时只补原缺失真实暂定金额，原 snapshot/before-after 审计 | 不自动重算已知金额、不因新价批量改历史；无 maintenance/migration 通用 CLI | [汇总/补算](../packages/domain/src/usage-summary.ts)、[Job](../apps/jobs/usage-collector/src/index.ts) |
 | 邮件 | 下限超限、6 小时提醒；费用恢复仅更新状态/事件，不发邮件；标题/正文含估算金额；Outbox、sender 验证及历史补算标注 | accepted 非 Delivered；unknown 不自动重发；旧待发恢复项也抑制，数据质量通知不变 | [事件](../packages/azure/src/alert-producer.ts)、[投递](../packages/azure/src/mail-dispatch.ts) |
 | API/GUI | 四个正式页面、价格/邮件/授权/采集独立状态查询、精简/raw 下载、阈值/名称/手动价侧栏 | 无 operations/issues/runs 通用 API、Marketplace 入口、时区/币种 GUI 修改 | [routes](../apps/web/server/src/app.ts)、[GUI](../apps/web/client/src/App.tsx) |
 | 验证工具 | 根 scripts、Vitest、Azurite、Playwright、Bicep/ACR CLI 交付证据 | 无 .github/workflows 或独立 property-based 测试工具；模拟规模不是云 SLA | [命令](../package.json)、[tests](../tests/) |
 
-最新已记录部署为 Web revision `0000020`（第 17 节），Web/Usage/Mail 使用 Models/邮件策略兼容
+最新已记录部署为 Web revision `0000021`（第 18 节），Web/Usage/Mail 使用 Models/缓存/档位兼容
 digest，Pricing Job 可继续使用原兼容版本；不要求四类 Job 在每次滚动发布阶段必为同一
 digest。实例中的正式运行限制不代表第七批生产加固已自动完成。
 
@@ -561,3 +561,26 @@ digest。实例中的正式运行限制不代表第七批生产加固已自动�
   `USD 1.13912–1.856737`，金额在标题及正文摘要中。邮件 Job 正常计划执行 succeeded，
   0 失败/unknown；配置、价格 ETag、原测试小时及已接受事件保持不变。
   本次调整未发送测试邮件，也未产生新模型调用。
+
+## 18. Cached / Priority 指标补充与上线（2026-11-06）
+
+- 主总量仍为 Models `InputTokens/OutputTokens`。运行时支持时，用
+  `ProcessedPromptTokens/GeneratedTokens` 的 `ServiceTierResponse` 分组补充实际档位，
+  同小时逐部署总量/版本核对通过后替换计费分组，不重复相加。只看请求档位不计价。
+- OpenAI `AzureOpenAIContextTokensCacheMatchRate` 按 Percent/Average 保存小时观测，
+  不推算精确缓存 token 或缓存折扣。Anthropic 专属读取/5m/1h 写入计数独立保存，
+  未确认 provider/TTL 计价时为部分估算/上限未知，不把缓存独有用量当完整零费用。
+- 新增可选 `billingTelemetry` 与独立 version 1 能力缓存；保留历史兼容和两小时发现周期。
+  GUI 展示实际档位数量、来源和缓存状态；费用恢复邮件仍关闭。
+- 342 项工作区测试、lint/typecheck/build、8 项基础设施契约及针对性 Blob/浏览器检查通过。
+  仅用 127 个正式构建输入构建 ACR `dtr`，未上传工作区 HTB/图片/演示附件。
+- Web `aoai-cost-test-web--0000021` Healthy、100% 流量，Web/Usage/Mail 镜像
+  `sha256:e2e89796ecde48f2afe3a8c3151688a2866d4af62461a43a5a47f41a88bdebda`；
+  先 Web/API reader，再 Usage/Mail。非 image 的配置、身份、资源和 cron 指纹未改，
+  Pricing/Authorization 保持原镜像。没有应用整套模板预览中的无关漂移。
+- 正常 Collector `aoai-cost-test-usage-ekh7iua` Succeeded；实际托管身份读到两个旧 token
+  指标的 `ServiceTierResponse` 及缓存命中率 Percent/Average，已保存 10:00–11:00 北京时间
+  小时的新字段。当前没有正用量，cache 为 noData/null、档位未知，零问题；不声称已验证
+  非零 Priority 或精确缓存折扣。Mail 正常执行 succeeded、0 失败/unknown。
+- 私网读回确认价格 ETag、tenant/mail/manual 配置和保留历史小时未改；API 匿名请求 401，
+  内部 readiness 200。未调用模型、未发送测试邮件、未增加其他 provider 价格。

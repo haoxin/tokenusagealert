@@ -89,6 +89,66 @@ test('missing non-token billing quantities remain an explicitly partial subtotal
   await expect(hour).toContainText('ADDITIONAL_BILLING_UNITS_MISSING')
 })
 
+test('served priority slices and cache-hit Percent are explicit and never presented as exact cached tokens', async ({ page }) => {
+  const hour: HourlyUsage = {
+    ...ranged, knownCostUsd: '35.2', knownCostUpperUsd: '35.2', estimatedCostUsd: '35.2',
+    breakdown: [{
+      ...ranged.breakdown[0]!, costUsd: '35.2', costUpperUsd: '35.2', pricingStatus: 'matched', pricingUncertainty: [],
+      billingSlices: [
+        { direction: 'input', tokens: '400000', tier: 'standard', context: null, modality: null },
+        { direction: 'input', tokens: '600000', tier: 'priority', context: null, modality: null },
+        { direction: 'output', tokens: '800000', tier: 'standard', context: null, modality: null },
+        { direction: 'output', tokens: '1200000', tier: 'priority', context: null, modality: null },
+      ],
+      prices: [{ ...price(1, 'input', 'short', '2'), bound: 'both' },
+        { ...price(2, 'output', 'short', '7'), bound: 'both' },
+        { ...price(3, 'input', 'short', '6'), tier: 'priority', bound: 'both' },
+        { ...price(4, 'output', 'short', '21'), tier: 'priority', bound: 'both' }],
+      billingTelemetry: { tierSource: 'azure-openai-usage', cache: { source: 'openai-cache-match-rate',
+        status: 'available', matchRatePercent: '42.5', readTokens: null, write5mTokens: null, write1hTokens: null } },
+    }],
+  }
+  await fixture(page, hour)
+  await page.goto(`/tenants/${id}/usage`)
+  const selected = page.getByRole('region', { name: '所选小时费用', exact: true })
+  await expect(selected).toContainText('OpenAI 补充指标 · 已与 Models 总量逐部署核对')
+  await expect(selected).toContainText('缓存命中率（小时平均）：42.5%')
+  await expect(selected).toContainText('不是精确缓存 token 数')
+  const tiers = selected.getByRole('table', { name: '实际服务档位 token' })
+  await expect(tiers.locator('tbody tr').filter({ hasText: 'Priority（优先）' })).toContainText('600,000')
+  await expect(tiers.locator('tbody tr').filter({ hasText: 'Priority（优先）' })).toContainText('1,200,000')
+  await expect(page.locator('.usage-summary-grid')).toContainText('US$35.20')
+  for (const width of [1440, 1024]) {
+    await page.setViewportSize({ width, height: 1080 })
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)
+    expect(overflow).toBeLessThanOrEqual(1)
+  }
+})
+
+test('provider-specific cache quantities and unavailable cache measurements are not collapsed to zero', async ({ page }) => {
+  const hour: HourlyUsage = {
+    ...ranged, status: 'partial', knownCostUsd: null, knownCostUpperUsd: null, estimatedCostUsd: null,
+    inputTokens: '0', outputTokens: '0', activity: 'hasUsage',
+    issues: [{ code: 'CACHE_BILLING_UNVERIFIED', message: '缓存计费协议未确认。', resourceId: null }],
+    breakdown: [{
+      ...ranged.breakdown[0]!, deployment: { ...ranged.breakdown[0]!.deployment, modelFormat: 'Anthropic' },
+      inputTokens: '0', outputTokens: '0', costUsd: null, costUpperUsd: null, pricingStatus: 'missing', prices: [],
+      billingTelemetry: { tierSource: 'unknown', cache: { source: 'anthropic-cache-tokens',
+        status: 'available', matchRatePercent: null, readTokens: '1000', write5mTokens: '80', write1hTokens: null } },
+    }],
+  }
+  await fixture(page, hour)
+  await page.route(`**/api/v1/tenants/${id}/alerts`, (route) => route.fulfill({ json: { items: [] } }))
+  await page.goto(`/tenants/${id}/usage`)
+  const selected = page.getByRole('region', { name: '所选小时费用', exact: true })
+  await expect(selected.locator('dl div').filter({ hasText: '缓存读取 token' })).toContainText('1,000')
+  await expect(selected.locator('dl div').filter({ hasText: '5 分钟 TTL' })).toContainText('80')
+  await expect(selected.locator('dl div').filter({ hasText: '1 小时 TTL' })).toContainText('—')
+  await expect(selected).toContainText('Anthropic 专属计数独立保留')
+  await expect(selected).toContainText('CACHE_BILLING_UNVERIFIED')
+  await expect(page.locator('.usage-summary-grid').locator('article').first()).toContainText('—')
+})
+
 test('range amounts and price references fit desktop and tablet widths without horizontal page overflow', async ({ page }) => {
   await fixture(page, ranged)
   await page.goto(`/tenants/${id}/usage`)

@@ -1,6 +1,6 @@
 import { Decimal } from 'decimal.js'
 import type { DeploymentUsage, HourlyUsage, UsageIssue, UsagePriceBook } from '@tokenusagealert/schemas'
-import { calculateDeploymentCost, indexUsagePrices } from './usage.js'
+import { calculateDeploymentCost, hasAdditionalCacheTokens, indexUsagePrices } from './usage.js'
 
 export function summarizeUsageCosts(
   breakdown: DeploymentUsage[],
@@ -10,9 +10,10 @@ export function summarizeUsageCosts(
   noDeployments: boolean,
 ) {
   const observed = breakdown.filter((item) => item.metricsStatus !== 'failed')
-  const hasUsage = observed.some((item) => new Decimal(item.inputTokens ?? 0).plus(item.outputTokens ?? 0).gt(0))
+  const hasUsage = observed.some((item) =>
+    new Decimal(item.inputTokens ?? 0).plus(item.outputTokens ?? 0).gt(0) || hasAdditionalCacheTokens(item))
   const unknownUnits = issues.some((issue) =>
-    ['UNSUPPORTED_BILLING_UNIT', 'ADDITIONAL_BILLING_UNITS_MISSING'].includes(issue.code))
+    ['UNSUPPORTED_BILLING_UNIT', 'ADDITIONAL_BILLING_UNITS_MISSING', 'CACHE_BILLING_UNVERIFIED'].includes(issue.code))
   const noUsage = observed.length > 0 && observed.length === breakdown.length && !hasUsage && !unknownUnits
   const priced = breakdown.filter((item) => item.costUsd !== null &&
     ['matched', 'range'].includes(item.pricingStatus))
@@ -61,6 +62,7 @@ export function repriceMissingUsageHour(hour: HourlyUsage, book: UsagePriceBook,
     ...(item.billingSlices ? { billingSlices: item.billingSlices } : {}),
     ...(item.cacheWriteTokens !== undefined ? { cacheWriteTokens: item.cacheWriteTokens } : {}),
     ...(item.metricFamily ? { metricFamily: item.metricFamily } : {}),
+    ...(item.billingTelemetry ? { billingTelemetry: item.billingTelemetry } : {}),
     issues: item.issues.filter((issue) => !obsoletePricingIssues.has(issue.code)),
   }, book, hour.windowStartUtc, index))
   const issues = [...hour.issues.filter((issue) => !obsoletePricingIssues.has(issue.code)),

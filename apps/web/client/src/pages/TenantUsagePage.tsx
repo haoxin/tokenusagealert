@@ -2,12 +2,48 @@ import { useEffect, useState } from 'react'
 import { Button, Select, Spinner, Tab, TabList } from '@fluentui/react-components'
 import { ArrowLeft20Regular, Database20Regular, Edit20Regular, Info20Regular, Warning20Regular } from '@fluentui/react-icons'
 import { Link, useParams } from 'react-router-dom'
-import type { HourlyUsage, TenantListItem, TenantUsageResponse } from '@tokenusagealert/schemas'
+import type { DeploymentUsage, HourlyUsage, TenantListItem, TenantUsageResponse } from '@tokenusagealert/schemas'
 import { getTenantConfig, getTenantUsage } from '../api'
 import { UsageChart } from '../components/UsageChart'
 import { TenantAlertTimeline } from '../components/MailPanels'
 import { TenantSettingsEditor } from '../components/TenantSettingsEditor'
 import { sumMoneyRange, sumUsageRange, UsageActions, UsageBadges, usageDate, usageError, usageMoney, usageMoneyRange, UsageNotice } from '../components/UsageShared'
+
+function BillingTelemetryDetails({ row }: { row: DeploymentUsage }) {
+  const telemetry = row.billingTelemetry
+  if (!telemetry) return <p className="pricing-muted">历史记录没有缓存/实际服务档位补充观测；不推断为零缓存或 Standard。</p>
+  const cache = telemetry.cache
+  const count = (value: string | null) => value === null ? '—' : BigInt(value).toLocaleString('zh-CN')
+  const tiers = new Map<string, { input: bigint; output: bigint }>()
+  for (const slice of row.billingSlices ?? []) {
+    const name = slice.tier ?? 'unknown'
+    const value = tiers.get(name) ?? { input: 0n, output: 0n }
+    value[slice.direction] += BigInt(slice.tokens)
+    tiers.set(name, value)
+  }
+  const tierNames: Record<string, string> = { standard: 'Standard（标准）', priority: 'Priority（优先）',
+    flex: 'Flex', batch: 'Batch', unknown: '实际档位未知' }
+  return <details className="usage-billing-telemetry" open>
+    <summary>缓存与实际服务档位</summary>
+    <p>档位来源：{telemetry.tierSource === 'azure-openai-usage' ? 'OpenAI 补充指标 · 已与 Models 总量逐部署核对'
+      : telemetry.tierSource === 'models' ? 'Models 响应档位维度' : '未确认 · 不以请求档位代替实际计费档位'}。</p>
+    {tiers.size > 0 && <table className="compact-table" aria-label="实际服务档位 token">
+      <thead><tr><th>实际档位</th><th>输入 token</th><th>输出 token</th></tr></thead>
+      <tbody>{[...tiers].map(([tier, value]) => <tr key={tier}><td>{tierNames[tier]}</td>
+        <td>{value.input.toLocaleString('zh-CN')}</td><td>{value.output.toLocaleString('zh-CN')}</td></tr>)}</tbody>
+    </table>}
+    <p>缓存观测：{({ available: '已读取', noData: '未返回观测值（不等于零）',
+      unsupported: '当前资源/模型未提供适用指标', failed: '读取失败（未填零）' })[cache.status]}。</p>
+    {cache.source === 'openai-cache-match-rate' && <p>缓存命中率（小时平均）：{cache.matchRatePercent === null
+      ? '—' : `${cache.matchRatePercent}%`}。这是百分比，不是精确缓存 token 数，不用于折算缓存折扣。</p>}
+    {cache.source === 'anthropic-cache-tokens' ? <>
+      <dl><div><dt>缓存读取 token</dt><dd>{count(cache.readTokens)}</dd></div>
+        <div><dt>缓存写入 token · 5 分钟 TTL</dt><dd>{count(cache.write5mTokens)}</dd></div>
+        <div><dt>缓存写入 token · 1 小时 TTL</dt><dd>{count(cache.write1hTokens)}</dd></div></dl>
+      <p className="pricing-muted">Anthropic 专属计数独立保留；未确认对应单价/计量规则时不与 OpenAI 输入扣减混算，也不声称完整费用。</p>
+    </> : <p className="pricing-muted">当前 Monitor 未提供适用的精确缓存读写 token；缓存读取仍按普通输入价保守估算。</p>}
+  </details>
+}
 
 function Breakdown({ hour }: { hour: HourlyUsage }) {
   const subscriptions = [...new Set(hour.breakdown.map((row) => row.deployment.subscriptionId))]
@@ -25,6 +61,7 @@ function Breakdown({ hour }: { hour: HourlyUsage }) {
               <div><dt>输出 token</dt><dd>{row.outputTokens === null ? '—' : Number(row.outputTokens).toLocaleString('zh-CN')}</dd></div>
               <div><dt>指标读取</dt><dd>{row.metricsStatus === 'noData' ? '请求成功，未返回用量' : row.metricsStatus === 'failed' ? '读取失败' : '已读取'}</dd></div>
               <div><dt>价格匹配</dt><dd>{({ matched: '已匹配', range: '已匹配 · 区间估算', missing: '缺少价格/计费维度', ambiguous: '价格不唯一', unsupported: '缺少对应计费单位用量' })[row.pricingStatus]}</dd></div></dl>
+            <BillingTelemetryDetails row={row} />
             {row.pricingUncertainty?.length ? <p className="pricing-muted">区间依据：{row.pricingUncertainty.map((value) =>
               ({ context: '短/长上下文', modality: '文本/图像/音频模态', version: '价格版本', variant: 'SKU 计费变体',
                 cacheWrite: '缓存写入未单独计量', tier: '实际服务档位未单独计量' })[value]).join('、')}。</p> : null}

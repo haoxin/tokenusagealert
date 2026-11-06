@@ -1,12 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import {
   CreateTenantRequestSchema,
+  BillingTelemetrySchema,
   DeleteTenantRegistrationResponseSchema,
   HourlyThresholdUsdSchema,
   TenantConfigSchema,
   TenantIdSchema,
   UpdateTenantSettingsRequestSchema,
 } from './index.js'
+
+describe('billing telemetry contracts', () => {
+  const cache = { source: 'openai-cache-match-rate', status: 'available', matchRatePercent: '50.5',
+    readTokens: null, write5mTokens: null, write1hTokens: null }
+  it('distinguishes percent from unknown token counts', () => {
+    expect(BillingTelemetrySchema.parse({ tierSource: 'unknown', cache }).cache.readTokens).toBeNull()
+  })
+  it.each(['-1', '100.1', 'NaN'])('rejects invalid cache percentages %s', (matchRatePercent) => {
+    expect(BillingTelemetrySchema.safeParse({ tierSource: 'models', cache: { ...cache, matchRatePercent } }).success).toBe(false)
+  })
+  it('rejects fractional cache token counts', () => {
+    expect(BillingTelemetrySchema.safeParse({ tierSource: 'models', cache: { ...cache, readTokens: '2.5' } }).success).toBe(false)
+  })
+})
 
 describe('TenantIdSchema', () => {
   it('normalizes a valid tenant id to lowercase', () => {

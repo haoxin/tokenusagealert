@@ -20,6 +20,7 @@ test-results/
 # Local Azure emulators
 .azurite/
 .azurite-e2e/
+.azure/validate-status.json
 
 # OS files
 .DS_Store

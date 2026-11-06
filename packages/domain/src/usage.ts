@@ -9,6 +9,12 @@ import { normalizedPriceLabel, priceVersionMatches, tokenPriceTerms } from './pr
 export const HOUR_MS = 3_600_000
 export const USAGE_RETENTION_MS = 240 * HOUR_MS
 
+export function hasAdditionalCacheTokens(observation: Pick<TokenObservation, 'billingTelemetry'>) {
+  const cache = observation.billingTelemetry?.cache
+  return cache?.source === 'anthropic-cache-tokens' &&
+    [cache.readTokens, cache.write5mTokens, cache.write1hTokens].some((value) => value !== null && new Decimal(value).gt(0))
+}
+
 export function collectionWindow(now: Date) {
   const end = Math.floor((now.getTime() - 15 * 60_000) / HOUR_MS) * HOUR_MS
   return {
@@ -98,6 +104,12 @@ export function calculateDeploymentCost(
   const deployment = observation.deployment
   const issue = (code: string, message: string) =>
     result.issues.push({ code, message, resourceId: deployment.id })
+  const cache = observation.billingTelemetry?.cache
+  const cacheBillingUnverified = cache?.source === 'anthropic-cache-tokens' &&
+    (cache.status === 'failed' || [cache.readTokens, cache.write5mTokens, cache.write1hTokens]
+      .some((value) => value === null || new Decimal(value).gt(0)))
+  if (cacheBillingUnverified) issue('CACHE_BILLING_UNVERIFIED',
+    '已读取 Anthropic 专属缓存计数，但现有价格/计量契约未确认缓存读写及 TTL 费用；不套用 OpenAI 缓存扣减规则，已知小计不代表完整费用。')
   if (!supportsTokenDeployment(deployment)) {
     result.pricingStatus = 'unsupported'
     issue('UNSUPPORTED_BILLING_UNIT', '该部署不是可用 Monitor 输入/输出 token 计量的按量 SKU；不能把容量/其他计量单位当作零费用。')
@@ -125,7 +137,8 @@ export function calculateDeploymentCost(
     return rates.filter((rate) => Date.parse(rate.effectiveFromUtc) === latest.get(normalizedPriceLabel(rate.skuName)))
   }
   const tiers = new Set<CompactPriceRate['tier']>(observation.billingSlices?.length
-    ? observation.billingSlices.flatMap((slice) => possibleTiers(slice.tier)) : [defaultTier])
+    ? observation.billingSlices.flatMap((slice) => possibleTiers(slice.tier))
+    : possibleTiers(observation.metricFamily === 'models-usage' ? null : defaultTier))
   const hasOfficial = [...tiers].some((tier) =>
     ['input', 'output', 'cachedInput', 'cacheWrite'].some((direction) => candidatesFor(direction, tier).length > 0))
   const unsupportedUnits = isBook(snapshot) ? snapshot.official?.unpricedUnits?.filter((item) =>
@@ -157,7 +170,8 @@ export function calculateDeploymentCost(
   if (observation.inputTokens === null || observation.outputTokens === null || observation.metricsStatus === 'failed') {
     return result
   }
-  const hasUsage = new Decimal(observation.inputTokens).plus(observation.outputTokens).gt(0)
+  const hasUsage = new Decimal(observation.inputTokens).plus(observation.outputTokens).gt(0) ||
+    hasAdditionalCacheTokens(observation)
   if (hasUsage && !observation.metadataVerified) {
     issue('HISTORICAL_DEPLOYMENT_UNVERIFIED', '尚未确认该小时的模型版本和部署元数据，不能把当前价格套到历史用量。')
     return result
@@ -167,8 +181,8 @@ export function calculateDeploymentCost(
       sum.plus(new Decimal(price.direction === 'input' ? observation.inputTokens! : observation.outputTokens!)
         .div(price.unitQuantity).times(price.unitPriceUsd)), new Decimal(0))
     result.costUsd = total.toFixed(12, Decimal.ROUND_HALF_EVEN)
-    result.costUpperUsd = result.costUsd
-    result.pricingStatus = 'matched'
+    result.costUpperUsd = cacheBillingUnverified ? null : result.costUsd
+    result.pricingStatus = cacheBillingUnverified ? 'missing' : 'matched'
     return result
   }
   if (!hasOfficial) {
@@ -179,7 +193,7 @@ export function calculateDeploymentCost(
   }
   const slices: TokenBillingSlice[] = observation.billingSlices?.length ? observation.billingSlices : (['input', 'output'] as const).map((direction) => ({
     direction, tokens: direction === 'input' ? observation.inputTokens! : observation.outputTokens!,
-    context: null, modality: null, tier: defaultTier,
+    context: null, modality: null, tier: observation.metricFamily === 'models-usage' ? null : defaultTier,
   }))
   for (const direction of ['input', 'output'] as const) {
     const total = slices.filter((slice) => slice.direction === direction)
@@ -192,7 +206,7 @@ export function calculateDeploymentCost(
   let lower = new Decimal(0)
   let upper = new Decimal(0)
   let matched = 0
-  let incomplete = unsupportedUnits.length > 0
+  let incomplete = unsupportedUnits.length > 0 || cacheBillingUnverified
   const uncertainty = new Set<NonNullable<DeploymentUsage['pricingUncertainty']>[number]>()
   const references = new Map<string, UsagePriceReference>()
   const addReference = (rate: UsageRate, direction: UsagePriceReference['direction'], bound: 'lower' | 'upper' | 'both') => {

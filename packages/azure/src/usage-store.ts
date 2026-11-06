@@ -1,6 +1,6 @@
 import { BlobServiceClient, type ContainerClient } from '@azure/storage-blob'
 import {
-  HourlyUsageSchema, ResourceInventorySchema, TenantDailyUsageSchema, TenantIdSchema, UsageRunSchema, UsageShardViewSchema,
+  BillingMetricCapabilitiesSchema, HourlyUsageSchema, ResourceInventorySchema, TenantDailyUsageSchema, TenantIdSchema, UsageRunSchema, UsageShardViewSchema,
   type HourlyUsage, type ResourceInventory, type UsageRun, type TenantDailyUsage, type UsageShardView,
   type UsagePriceBook,
 } from '@tokenusagealert/schemas'
@@ -21,6 +21,7 @@ const cacheSchema = z.object({
   })),
   metricDimensions: z.record(z.string(), z.array(z.string())),
   modelsMetricDimensions: z.record(z.string(), z.array(z.string())).optional(),
+  billingMetricCapabilities: z.record(z.string(), BillingMetricCapabilitiesSchema).optional(),
 })
 
 export class UsageTopologyMismatchError extends Error {
@@ -105,6 +106,7 @@ export class BlobUsageStore {
       accounts: resources.accounts.map((account) => ({
         ...account, ...(cache.metricDimensions[account.id] ? { metricDimensions: cache.metricDimensions[account.id] } : {}),
         ...(cache.modelsMetricDimensions?.[account.id] ? { modelsMetricDimensions: cache.modelsMetricDimensions[account.id] } : {}),
+        ...(cache.billingMetricCapabilities?.[account.id] ? { billingMetricCapabilities: cache.billingMetricCapabilities[account.id] } : {}),
       })),
     }
   }
@@ -114,7 +116,8 @@ export class BlobUsageStore {
     const name = `tenants/${data.tenantId}/resources.json`
     const previous = await this.read(this.inventory, name)
     const { subscriptionDiscovery: _discovery, ...base } = data
-    const accounts = data.accounts.map(({ metricDimensions: _dimensions, modelsMetricDimensions: _modelsDimensions, ...account }) => account)
+    const accounts = data.accounts.map(({ metricDimensions: _dimensions, modelsMetricDimensions: _modelsDimensions,
+      billingMetricCapabilities: _capabilities, ...account }) => account)
     // Keep the baseline inventory readable by the previous release; cache metadata has its own document.
     await this.write(this.inventory, name, { ...base, accounts }, previous?.etag ?? null, signal)
     const cacheName = `tenants/${data.tenantId}/resource-cache.json`
@@ -126,6 +129,8 @@ export class BlobUsageStore {
         .map((account) => [account.id, account.metricDimensions])),
       modelsMetricDimensions: Object.fromEntries(data.accounts.filter((account) => account.modelsMetricDimensions)
         .map((account) => [account.id, account.modelsMetricDimensions])),
+      billingMetricCapabilities: Object.fromEntries(data.accounts.filter((account) => account.billingMetricCapabilities)
+        .map((account) => [account.id, account.billingMetricCapabilities])),
     }), oldCache?.etag ?? null, signal)
   }
 

@@ -3,6 +3,7 @@ import { BillingContextSchema, BillingModalitySchema, BillingTierSchema } from '
 
 const time = z.iso.datetime({ offset: true })
 const amount = z.string().regex(/^\d+(?:\.\d+)?$/)
+const tokenAmount = z.string().regex(/^\d+$/)
 const identifier = z.string().uuid().transform((value) => value.toLowerCase())
 
 export const UsageExecutionSettingsSchema = z.object({
@@ -71,6 +72,16 @@ export const DeploymentInventorySchema = z.object({
   deleted: z.boolean(),
 }).strict()
 
+export const BillingMetricCapabilitiesSchema = z.object({
+  version: z.literal(1),
+  definitions: z.array(z.object({
+    name: z.string().min(1),
+    dimensions: z.array(z.string()),
+    unit: z.string().nullable(),
+    aggregations: z.array(z.string()),
+  }).strict()).max(8),
+}).strict()
+
 export const ResourceInventorySchema = z.object({
   schemaVersion: z.literal(1),
   tenantId: identifier,
@@ -80,6 +91,7 @@ export const ResourceInventorySchema = z.object({
     subscriptionId: identifier,
     metricDimensions: z.array(z.string()).optional(),
     modelsMetricDimensions: z.array(z.string()).optional(),
+    billingMetricCapabilities: BillingMetricCapabilitiesSchema.optional(),
   }).strict()),
   subscriptionDiscovery: z.array(z.object({
     subscriptionId: identifier, discoveredAtUtc: time,
@@ -90,10 +102,22 @@ export const ResourceInventorySchema = z.object({
 
 export const TokenBillingSliceSchema = z.object({
   direction: z.enum(['input', 'output']),
-  tokens: amount,
+  tokens: tokenAmount,
   context: BillingContextSchema.nullable(),
   modality: BillingModalitySchema.nullable(),
   tier: BillingTierSchema.nullable(),
+}).strict()
+
+export const BillingTelemetrySchema = z.object({
+  tierSource: z.enum(['models', 'azure-openai-usage', 'unknown']),
+  cache: z.object({
+    source: z.enum(['openai-cache-match-rate', 'anthropic-cache-tokens', 'unavailable']),
+    status: z.enum(['available', 'noData', 'unsupported', 'failed']),
+    matchRatePercent: amount.refine((value) => Number(value) <= 100).nullable(),
+    readTokens: tokenAmount.nullable(),
+    write5mTokens: tokenAmount.nullable(),
+    write1hTokens: tokenAmount.nullable(),
+  }).strict(),
 }).strict()
 
 export const TokenObservationSchema = z.object({
@@ -105,6 +129,7 @@ export const TokenObservationSchema = z.object({
   billingSlices: z.array(TokenBillingSliceSchema).optional(),
   cacheWriteTokens: amount.nullable().optional(),
   metricFamily: z.enum(['azure-openai-usage', 'models-usage']).optional(),
+  billingTelemetry: BillingTelemetrySchema.optional(),
   issues: z.array(UsageIssueSchema),
 }).strict()
 
@@ -257,6 +282,8 @@ export type DeploymentInventory = z.infer<typeof DeploymentInventorySchema>
 export type ResourceInventory = z.infer<typeof ResourceInventorySchema>
 export type TokenObservation = z.infer<typeof TokenObservationSchema>
 export type TokenBillingSlice = z.infer<typeof TokenBillingSliceSchema>
+export type BillingMetricCapabilities = z.infer<typeof BillingMetricCapabilitiesSchema>
+export type BillingTelemetry = z.infer<typeof BillingTelemetrySchema>
 export type UsagePriceReference = z.infer<typeof UsagePriceReferenceSchema>
 export type DeploymentUsage = z.infer<typeof DeploymentUsageSchema>
 export type HourlyUsage = z.infer<typeof HourlyUsageSchema>
