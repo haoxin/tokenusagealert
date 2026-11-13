@@ -55,6 +55,22 @@ export const UsageIssueSchema = z.object({
   resourceId: z.string().nullable(),
 }).strict()
 
+export const FoundryEstimatedCostSchema = z.object({
+  metricName: z.literal('FoundryModelEstimatedCost'),
+  currency: z.literal('USD'),
+  status: z.enum(['available', 'noData', 'unsupported', 'failed', 'partial']),
+  costUsd: amount.nullable(),
+  retrievedAtUtc: time,
+  issue: UsageIssueSchema.nullable(),
+}).strict().superRefine((value, context) => {
+  if ((value.status === 'available') !== (value.costUsd !== null)) {
+    context.addIssue({ code: 'custom', message: '原生费用只有完整可用时才能带金额；缺失或失败不填零。' })
+  }
+  if (value.status === 'failed' && value.issue === null) {
+    context.addIssue({ code: 'custom', message: '原生费用读取失败必须保留问题信息。' })
+  }
+})
+
 export const DeploymentInventorySchema = z.object({
   id: z.string().min(1),
   subscriptionId: identifier,
@@ -73,13 +89,13 @@ export const DeploymentInventorySchema = z.object({
 }).strict()
 
 export const BillingMetricCapabilitiesSchema = z.object({
-  version: z.literal(1),
+  version: z.union([z.literal(1), z.literal(2)]),
   definitions: z.array(z.object({
     name: z.string().min(1),
     dimensions: z.array(z.string()),
     unit: z.string().nullable(),
     aggregations: z.array(z.string()),
-  }).strict()).max(8),
+  }).strict()).max(9),
 }).strict()
 
 export const ResourceInventorySchema = z.object({
@@ -130,11 +146,12 @@ export const TokenObservationSchema = z.object({
   cacheWriteTokens: amount.nullable().optional(),
   metricFamily: z.enum(['azure-openai-usage', 'models-usage']).optional(),
   billingTelemetry: BillingTelemetrySchema.optional(),
+  foundryEstimatedCost: FoundryEstimatedCostSchema.optional(),
   issues: z.array(UsageIssueSchema),
 }).strict()
 
 export const UsagePriceReferenceSchema = z.object({
-  direction: z.enum(['input', 'output', 'cacheWrite']),
+  direction: z.enum(['input', 'output', 'cachedInput', 'cacheWrite']),
   meterId: z.string().uuid().nullable(),
   source: z.enum(['official', 'manual']).optional(),
   manualPriceId: z.string().uuid().optional(),
@@ -163,7 +180,20 @@ export const DeploymentUsageSchema = TokenObservationSchema.extend({
   costUsd: amount.nullable(),
   costUpperUsd: amount.nullable().optional(),
   pricingStatus: z.enum(['matched', 'range', 'unsupported', 'missing', 'ambiguous']),
-  pricingUncertainty: z.array(z.enum(['context', 'modality', 'version', 'variant', 'cacheWrite', 'tier'])).optional(),
+  pricingUncertainty: z.array(z.enum(['context', 'modality', 'version', 'variant', 'cacheRead', 'cacheWrite', 'tier'])).optional(),
+  cacheReadEstimate: z.object({
+    method: z.literal('hourly-match-rate'),
+    matchRatePercent: amount.refine((value) => Number(value) <= 100),
+    estimatedReadTokens: amount,
+    estimatedNonCachedInputTokens: amount,
+    tierAllocation: z.literal('same-ratio-per-tier'),
+  }).strict().optional(),
+  contextMixEstimate: z.object({
+    method: z.literal('equal-short-long'),
+    basis: z.literal('tokens'),
+    shortWeight: z.literal('0.5'),
+    longWeight: z.literal('0.5'),
+  }).strict().optional(),
   prices: z.array(UsagePriceReferenceSchema),
 }).strict()
 
@@ -176,6 +206,7 @@ export const HourlyUsageSchema = z.object({
   metricFamily: z.enum(['azure-openai-usage', 'models-usage']).optional(),
   repricedAtUtc: time.optional(),
   pricingRepairAuditId: identifier.optional(),
+  comparisonBackfillAuditId: identifier.optional(),
   source: z.enum(['azure-monitor', 'fixture']),
   status: z.enum(['complete', 'partial', 'failed']),
   activity: z.enum(['noDeployments', 'noUsage', 'hasUsage', 'unknown']),
@@ -185,13 +216,14 @@ export const HourlyUsageSchema = z.object({
   estimatedCostUsd: amount.nullable(),
   knownCostUsd: amount.nullable(),
   knownCostUpperUsd: amount.nullable().optional(),
+  foundryEstimatedCost: FoundryEstimatedCostSchema.optional(),
   thresholdUsd: amount.nullable(),
   inputTokens: amount.nullable(),
   outputTokens: amount.nullable(),
   priceSnapshotId: z.string().uuid().nullable(),
   manualPriceSnapshotId: z.string().uuid().nullable().optional(),
-  estimatePolicy: z.enum(['cached-input-at-standard-rate', 'model-independent-retail-range']),
-  pricingRuleVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  estimatePolicy: z.enum(['cached-input-at-standard-rate', 'model-independent-retail-range', 'cache-ratio-retail-range', 'equal-context-retail-range']),
+  pricingRuleVersion: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
   validation: z.literal('awaiting-positive-usage-verification'),
   coverage: z.object({
     expectedSubscriptions: z.number().int().nonnegative(),
@@ -278,6 +310,7 @@ export const UsageShardViewSchema = z.object({
 }).strict()
 
 export type UsageIssue = z.infer<typeof UsageIssueSchema>
+export type FoundryEstimatedCost = z.infer<typeof FoundryEstimatedCostSchema>
 export type DeploymentInventory = z.infer<typeof DeploymentInventorySchema>
 export type ResourceInventory = z.infer<typeof ResourceInventorySchema>
 export type TokenObservation = z.infer<typeof TokenObservationSchema>

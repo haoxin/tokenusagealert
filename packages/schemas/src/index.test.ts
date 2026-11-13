@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   CreateTenantRequestSchema,
   BillingTelemetrySchema,
+  DeploymentUsageSchema,
+  FoundryEstimatedCostSchema,
   DeleteTenantRegistrationResponseSchema,
   HourlyThresholdUsdSchema,
   TenantConfigSchema,
@@ -20,6 +22,25 @@ describe('billing telemetry contracts', () => {
   })
   it('rejects fractional cache token counts', () => {
     expect(BillingTelemetrySchema.safeParse({ tierSource: 'models', cache: { ...cache, readTokens: '2.5' } }).success).toBe(false)
+  })
+  it('permits fractional ratio estimates only in the explicitly estimated contract', () => {
+    const estimate = { method: 'hourly-match-rate', matchRatePercent: '25',
+      estimatedReadTokens: '2.5', estimatedNonCachedInputTokens: '7.5', tierAllocation: 'same-ratio-per-tier' }
+    expect(DeploymentUsageSchema.shape.cacheReadEstimate.parse(estimate)).toEqual(estimate)
+    expect(DeploymentUsageSchema.shape.cacheReadEstimate.safeParse({ ...estimate, estimatedReadTokens: '-1' }).success).toBe(false)
+    expect(DeploymentUsageSchema.shape.cacheReadEstimate.safeParse({ ...estimate, matchRatePercent: '101' }).success).toBe(false)
+    expect(DeploymentUsageSchema.shape.cacheReadEstimate.safeParse({ ...estimate, method: 'measured-tokens' }).success).toBe(false)
+  })
+})
+
+describe('native monetary estimate availability', () => {
+  it('rejects success-shaped missing values and zero-shaped unavailable values', () => {
+    const estimate = { metricName: 'FoundryModelEstimatedCost', currency: 'USD', status: 'available',
+      costUsd: '2.855756600000', retrievedAtUtc: '2026-11-13T03:00:00.000Z', issue: null }
+    expect(FoundryEstimatedCostSchema.parse(estimate).costUsd).toBe('2.855756600000')
+    expect(FoundryEstimatedCostSchema.safeParse({ ...estimate, costUsd: null }).success).toBe(false)
+    expect(FoundryEstimatedCostSchema.safeParse({ ...estimate, status: 'noData', costUsd: '0' }).success).toBe(false)
+    expect(FoundryEstimatedCostSchema.safeParse({ ...estimate, status: 'failed', costUsd: null }).success).toBe(false)
   })
 })
 

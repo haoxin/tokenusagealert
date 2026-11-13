@@ -1,4 +1,4 @@
-import { alertEmailSuppression, evaluateAlertHour } from '@tokenusagealert/domain'
+import { alertEmailSuppression, evaluateAlertHour, USAGE_PRICING_RULE_VERSION } from '@tokenusagealert/domain'
 import { Decimal } from 'decimal.js'
 import {
   AlertEventSchema, OutboxRecordSchema, type HourlyUsage, type TenantListItem, type OutboxRecord, type AlertKind,
@@ -20,7 +20,8 @@ export class AlertProducer implements UsageAlertSink {
   }
   async repriced(tenant: TenantListItem, before: HourlyUsage, after: HourlyUsage) {
     if (before.source !== 'azure-monitor' || after.source !== 'azure-monitor' || before.knownCostUsd !== null || !after.repricedAtUtc ||
-      after.pricingRuleVersion !== 3 || before.inputTokens !== after.inputTokens || before.outputTokens !== after.outputTokens ||
+      ![3, 4, USAGE_PRICING_RULE_VERSION].includes(after.pricingRuleVersion) ||
+      before.inputTokens !== after.inputTokens || before.outputTokens !== after.outputTokens ||
       before.tenantId !== tenant.tenantId || after.tenantId !== tenant.tenantId ||
       before.windowStartUtc !== after.windowStartUtc || before.windowEndUtc !== after.windowEndUtc ||
       before.thresholdUsd !== after.thresholdUsd || before.priceSnapshotId !== after.priceSnapshotId) {

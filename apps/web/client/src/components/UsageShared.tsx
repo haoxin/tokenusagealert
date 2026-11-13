@@ -3,7 +3,7 @@ import { Badge, Button, Spinner } from '@fluentui/react-components'
 import {
   ArrowSync20Regular, CheckmarkCircle20Regular, Clock20Regular, ErrorCircle20Regular, Info20Regular, Warning20Regular,
 } from '@fluentui/react-icons'
-import type { HourlyUsage, UsageRun } from '@tokenusagealert/schemas'
+import type { FoundryEstimatedCost, HourlyUsage, UsageRun } from '@tokenusagealert/schemas'
 import { ApiError, startUsageCollection } from '../api'
 import { formatPricingDate } from './PricingShared'
 
@@ -33,6 +33,24 @@ export function sumUsageRange(hours: HourlyUsage[]) {
   return sumMoneyRange(hours.map((hour) => ({ lower: hour.knownCostUsd, upper: hour.knownCostUpperUsd })))
 }
 
+export function usageReferenceMoney(hour: HourlyUsage | null | undefined) {
+  if (!hour || hour.status === 'failed') return '—'
+  return hour.pricingRuleVersion >= 5 ? usageMoney(hour.knownCostUsd)
+    : usageMoneyRange(hour.knownCostUsd, hour.knownCostUpperUsd)
+}
+
+export function sumFoundryUsage(hours: HourlyUsage[]) {
+  const available = hours.filter((hour) => hour.foundryEstimatedCost?.status === 'available')
+  return { costUsd: sumUsageMoney(available.map((hour) => hour.foundryEstimatedCost?.costUsd ?? null)),
+    coveredHours: available.length, totalHours: hours.length }
+}
+
+export function usageFoundryStatus(estimate: FoundryEstimatedCost | undefined) {
+  return estimate ? ({ available: 'Azure 原生估算可用', noData: '原生指标暂无数据',
+    unsupported: '当前无适用原生指标', failed: '原生费用读取失败', partial: '原生费用覆盖不完整' })[estimate.status]
+    : '未取得原生费用（历史未采集或无适用指标）'
+}
+
 export function sumUsageMoney(values: Array<string | null>): string | null {
   const available = values.filter((value): value is string => value !== null)
   if (!available.length) return null
@@ -53,7 +71,7 @@ export function UsageNotice() {
     <Info20Regular aria-hidden="true" />
     <div>
       <strong>Models - Usage 采集 · USD 零售价估算</strong>
-      <span>总量使用 InputTokens/OutputTokens；实际档位补充指标必须与总量核对后才用于计价。缓存命中率不是精确缓存 token，不折算折扣；缺失不填零。官方目录仍仅 Azure OpenAI，条件不足显示估算区间，不是实际账单。</span>
+      <span>浅蓝虚线为本地参考估算：输入/输出按 50% 短上下文、50% 长上下文计价，各实际档位独立匹配单价；按小时比例估算缓存读取并匹配单价，缓存命中率不是精确缓存 token。深蓝实线为 FoundryModelEstimatedCost 原生 USD 估算；缺失不填零、不用参考金额代替。历史口径以小时明细为准，两种估算都不是实际账单。</span>
     </div>
   </div>
 }
@@ -73,6 +91,11 @@ export function UsageBadges({ hour }: { hour: HourlyUsage | null }) {
     {hour.source === 'fixture' && <Badge appearance="tint" color="warning" icon={<Info20Regular />}>本地模拟来源</Badge>}
     {hour.metricFamily && <Badge appearance="tint" color="informative" icon={<Info20Regular />}>
       {hour.metricFamily === 'models-usage' ? 'Models - Usage' : 'Azure OpenAI - Usage'}</Badge>}
+    {hour.pricingRuleVersion >= 5 && <Badge appearance="tint" color="informative">50/50 上下文参考</Badge>}
+    <Badge appearance="tint" color={hour.foundryEstimatedCost?.status === 'available' ? 'informative'
+      : hour.foundryEstimatedCost?.status === 'failed' ? 'danger' : 'warning'} icon={<Info20Regular />}>
+      {usageFoundryStatus(hour.foundryEstimatedCost)}
+    </Badge>
     {hour.knownCostUsd !== null && hour.knownCostUpperUsd !== undefined &&
       (hour.knownCostUpperUsd === null || Number(hour.knownCostUpperUsd) > Number(hour.knownCostUsd)) &&
       <Badge appearance="tint" color="informative" icon={<Info20Regular />}>区间估算</Badge>}
@@ -136,24 +159,37 @@ export function UsageActions({ refresh }: { refresh: () => void }) {
 
 export function UsageSparkline({ hours }: { hours: HourlyUsage[] }) {
   const sorted = [...hours].sort((a, b) => a.windowStartUtc.localeCompare(b.windowStartUtc))
-  const values = sorted.map((hour) => hour.knownCostUsd === null ? null : Number(hour.knownCostUsd))
-  const max = Math.max(1, ...values.filter((value): value is number => value !== null))
-  const segments: string[] = []
-  let points: string[] = []
-  for (let i = 0; i < sorted.length; i++) {
-    if (i && Date.parse(sorted[i]!.windowStartUtc) - Date.parse(sorted[i - 1]!.windowStartUtc) > 3_600_000) {
+  const sources = [
+    { color: '#479ef5', dash: '3 3', values: sorted.map((hour) =>
+      hour.knownCostUsd === null || hour.status === 'failed' ? null : Number(hour.knownCostUsd)) },
+    { color: '#0f6cbd', dash: undefined, values: sorted.map((hour) =>
+      hour.foundryEstimatedCost?.costUsd === undefined || hour.foundryEstimatedCost.costUsd === null
+        ? null : Number(hour.foundryEstimatedCost.costUsd)) },
+  ]
+  const max = Math.max(1, ...sources.flatMap((source) => source.values.filter((value): value is number => value !== null)))
+  return <svg width="132" height="36" role="img" aria-label={hours.length
+    ? '浅蓝虚线为参考估算，深蓝实线为 Azure 原生估算；缺失数据不补零' : '暂无趋势记录'}>
+    {sources.map((source) => {
+      const segments: string[] = []
+      let points: string[] = []
+      for (let i = 0; i < sorted.length; i++) {
+        if (i && Date.parse(sorted[i]!.windowStartUtc) - Date.parse(sorted[i - 1]!.windowStartUtc) > 3_600_000) {
+          if (points.length) segments.push(points.join(' '))
+          points = []
+        }
+        const value = source.values[i]
+        if (value === null || value === undefined) {
+          if (points.length) segments.push(points.join(' '))
+          points = []
+        } else points.push(`${4 + i * 120 / Math.max(sorted.length - 1, 1)},${30 - value / max * 25}`)
+      }
       if (points.length) segments.push(points.join(' '))
-      points = []
-    }
-    const value = values[i]
-    if (value === null || value === undefined) {
-      if (points.length) segments.push(points.join(' '))
-      points = []
-    } else points.push(`${4 + i * 120 / Math.max(sorted.length - 1, 1)},${30 - value / max * 25}`)
-  }
-  if (points.length) segments.push(points.join(' '))
-  return <svg width="132" height="36" role="img" aria-label={hours.length ? '已记录小时的费用趋势；缺失数据不补零' : '暂无趋势记录'}>
-    {segments.map((line, i) => <polyline key={i} points={line} fill="none" stroke="#0f6cbd" strokeWidth="2" />)}
-    {hours.length === 1 && values[0] !== null && <circle cx="4" cy={30 - (values[0] ?? 0) / max * 25} r="3" fill="#0f6cbd" />}
+      return <g key={source.color}>
+        {segments.map((line, i) => <polyline key={i} points={line} fill="none" stroke={source.color}
+          strokeDasharray={source.dash} strokeWidth={source.dash ? 1.5 : 2} />)}
+        {hours.length === 1 && source.values[0] !== null &&
+          <circle cx="4" cy={30 - (source.values[0] ?? 0) / max * 25} r="3" fill={source.color} />}
+      </g>
+    })}
   </svg>
 }

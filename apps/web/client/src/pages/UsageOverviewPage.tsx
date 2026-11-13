@@ -4,7 +4,7 @@ import { CheckmarkCircle20Regular, Search20Regular, Warning20Regular } from '@fl
 import { Link } from 'react-router-dom'
 import type { UsageOverview } from '@tokenusagealert/schemas'
 import { getUsageDashboard } from '../api'
-import { sumUsageRange, UsageActions, UsageBadges, usageDate, usageError, usageMoney, usageMoneyRange, UsageNotice, UsageRunSummary, UsageSparkline } from '../components/UsageShared'
+import { sumFoundryUsage, sumUsageRange, UsageActions, UsageBadges, usageDate, usageError, usageMoney, usageMoneyRange, usageReferenceMoney, UsageNotice, UsageRunSummary, UsageSparkline } from '../components/UsageShared'
 
 export function UsageOverviewPage() {
   const [data, setData] = useState<UsageOverview | null>(null)
@@ -31,6 +31,8 @@ export function UsageOverviewPage() {
   const tenants = data?.tenants ?? []
   const known = sumUsageRange(tenants.flatMap((tenant) => tenant.latest ? [tenant.latest] : []))
   const day = sumUsageRange(tenants.flatMap((tenant) => tenant.hours))
+  const nativeKnown = sumFoundryUsage(tenants.flatMap((tenant) => tenant.latest ? [tenant.latest] : []))
+  const nativeDay = sumFoundryUsage(tenants.flatMap((tenant) => tenant.hours))
   const breaches = tenants.filter((tenant) => tenant.latest?.knownCostUsd !== null && tenant.latest?.knownCostUsd !== undefined &&
     tenant.latest.thresholdUsd !== null && Number(tenant.latest.knownCostUsd) > Number(tenant.latest.thresholdUsd)).length
   const anomalies = tenants.filter((tenant) => tenant.latest && tenant.latest.status !== 'complete').length
@@ -48,9 +50,11 @@ export function UsageOverviewPage() {
     {error && <div className="message error" role="alert">{error}</div>}
     <div className="usage-summary-grid">
       {[
-        ['最近小时已知估算小计', usageMoneyRange(known.lower, known.upper), '缺失订阅/未匹配价格不计入完整总额'],
-        ['24 小时已知估算小计', usageMoneyRange(day.lower, day.upper), '仅累加已记录小时，缺口不补零'],
-        ['已知金额超阈值', data ? String(breaches) : '—', '估算下限超限时触发；通知需已启用'],
+        ['最近小时参考小计', usageMoneyRange(known.lower, known.upper), '本地参考金额；缺失部分不计入完整总额'],
+        ['最近小时原生小计', usageMoney(nativeKnown.costUsd), `覆盖 ${nativeKnown.coveredHours}/${nativeKnown.totalHours} 个租户小时`],
+        ['24 小时参考小计', usageMoneyRange(day.lower, day.upper), '仅累加已记录小时，历史口径保留'],
+        ['24 小时原生小计', usageMoney(nativeDay.costUsd), `覆盖 ${nativeDay.coveredHours}/${nativeDay.totalHours} 个已记录小时；缺失不填零`],
+        ['已知金额超阈值', data ? String(breaches) : '—', '仍比较本地参考金额；原生为独立对照'],
         ['数据不完整租户', data ? String(anomalies) : '—', '无历史记录的未启用租户不视为正常零费用'],
       ].map(([label, value, note]) => <article className="panel" key={label}><small>{label}</small><strong>{value}</strong><p>{note}</p></article>)}
     </div>
@@ -75,8 +79,9 @@ export function UsageOverviewPage() {
               <td><Badge appearance="tint" color={tenant.status === 'active' ? 'success' : 'warning'} icon={tenant.status === 'active' ? <CheckmarkCircle20Regular /> : <Warning20Regular />}>
                 {({ active: '授权正常', degraded: '授权范围变化', disconnected: '授权断开', discovered: '待启用', pendingAuthorization: '待授权', disabled: '已停用' } as Record<string, string>)[tenant.status] ?? tenant.status}
               </Badge></td>
-              <td><strong>{usageMoneyRange(tenant.latest?.status === 'failed' ? null : tenant.latest?.knownCostUsd, tenant.latest?.knownCostUpperUsd)}</strong>
-                <small className="usage-secondary">{tenant.latest?.status === 'partial' ? '已知估算小计 · 非完整总额' : tenant.latest ? '零售价估算' : '尚无该小时记录'}</small>
+              <td><strong>参考 {usageReferenceMoney(tenant.latest)}</strong>
+                <small className="usage-secondary">原生 {usageMoney(tenant.latest?.foundryEstimatedCost?.costUsd)}</small>
+                <small className="usage-secondary">{tenant.latest?.status === 'partial' ? '已知参考小计 · 非完整总额' : tenant.latest ? '两种估算均非实际账单' : '尚无该小时记录'}</small>
                 <small className="usage-secondary">阈值 {usageMoney(tenant.thresholdUsd)} / 小时</small></td>
               <td><UsageSparkline hours={tenant.hours} /></td>
               <td><UsageBadges hour={tenant.latest} /></td>

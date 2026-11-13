@@ -40,7 +40,7 @@ const hour = HourlyUsageSchema.parse({
 })
 
 describe('durable alert and Outbox workflow', () => {
-  it('notifies a newly priced historical breach once with an explicit historical label, without regressing the current alert state', async () => {
+  it.each([3, 4] as const)('notifies a version %s historical breach once without regressing the current alert state', async (pricingRuleVersion) => {
     const f = await fixture()
     try {
       const saved = await f.store.saveSettings({ enabled: true, operationsRecipients: ['chx@ms-ext.biz'] }, null, 'fixture')
@@ -51,7 +51,7 @@ describe('durable alert and Outbox workflow', () => {
       await f.producer.evaluate(tenant, { ...hour, knownCostUsd: '0', estimatedCostUsd: '0' })
       const state = await f.store.subject(`tenant-${tenant.tenantId}`)
       const before = { ...hour, source: 'azure-monitor' as const, knownCostUsd: null, estimatedCostUsd: null }
-      const after = { ...before, knownCostUsd: '20', knownCostUpperUsd: '30', pricingRuleVersion: 3 as const,
+      const after = { ...before, knownCostUsd: '20', knownCostUpperUsd: '30', pricingRuleVersion,
         repricedAtUtc: new Date().toISOString() }
       const event = await f.producer.repriced(tenant, before, after)
       expect(event).toMatchObject({ kind: 'cost-exceeded', amountUsd: '20', amountUpperUsd: '30', windowStartUtc: before.windowStartUtc })

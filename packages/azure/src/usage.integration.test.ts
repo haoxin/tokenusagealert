@@ -33,8 +33,8 @@ describe('usage hourly storage and shard coordination', () => {
     const f = await fixture()
     try {
       const value = HourlyUsageSchema.parse({
-        ...hour(), activity: 'hasUsage', estimatedCostUsd: '35.2', knownCostUsd: '35.2', knownCostUpperUsd: '35.2',
-        inputTokens: '1000000', outputTokens: '2000000', pricingRuleVersion: 3, estimatePolicy: 'model-independent-retail-range',
+        ...hour(), activity: 'hasUsage', estimatedCostUsd: '34.21', knownCostUsd: '34.21', knownCostUpperUsd: '35.035',
+        inputTokens: '1000000', outputTokens: '2000000', pricingRuleVersion: 4, estimatePolicy: 'cache-ratio-retail-range',
         coverage: { expectedSubscriptions: 1, successfulSubscriptions: 1, accounts: 1,
           expectedDeployments: 1, successfulDeployments: 1, pricedDeployments: 1 },
         breakdown: [{
@@ -43,9 +43,18 @@ describe('usage hourly storage and shard coordination', () => {
             modelName: 'gpt-fixture', modelVersion: '2026-01-01', modelFormat: 'OpenAI', sku: 'GlobalStandard',
             firstObservedAtUtc: '2026-01-01T00:00:00Z', observedAtUtc: new Date().toISOString(), deleted: false },
           inputTokens: '1000000', outputTokens: '2000000', metricsStatus: 'success', metadataVerified: true, issues: [],
-          costUsd: '35.2', costUpperUsd: '35.2', prices: [], pricingStatus: 'matched', metricFamily: 'models-usage',
+          costUsd: '34.21', costUpperUsd: '35.035', prices: [], pricingStatus: 'range', metricFamily: 'models-usage',
+          pricingUncertainty: ['cacheRead', 'cacheWrite'],
+          cacheReadEstimate: { method: 'hourly-match-rate', matchRatePercent: '25',
+            estimatedReadTokens: '250000', estimatedNonCachedInputTokens: '750000', tierAllocation: 'same-ratio-per-tier' },
+          billingSlices: [
+            { direction: 'input', tokens: '400000', tier: 'standard', context: null, modality: null },
+            { direction: 'input', tokens: '600000', tier: 'priority', context: null, modality: null },
+            { direction: 'output', tokens: '800000', tier: 'standard', context: null, modality: null },
+            { direction: 'output', tokens: '1200000', tier: 'priority', context: null, modality: null },
+          ],
           billingTelemetry: { tierSource: 'azure-openai-usage', cache: { source: 'openai-cache-match-rate',
-            status: 'available', matchRatePercent: '42.5', readTokens: null, write5mTokens: null, write1hTokens: null } },
+            status: 'available', matchRatePercent: '25', readTokens: null, write5mTokens: null, write1hTokens: null } },
         }],
       })
       await f.store.saveHour(value, signal())

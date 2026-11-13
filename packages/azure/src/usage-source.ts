@@ -1,5 +1,6 @@
 import { DefaultAzureCredential } from '@azure/identity'
 import { setTimeout as delay } from 'node:timers/promises'
+import { Decimal } from 'decimal.js'
 import { z } from 'zod'
 import { mapConcurrent, RequestLimiter } from '@tokenusagealert/domain'
 import { UsageExecutionSettingsSchema } from '@tokenusagealert/schemas'
@@ -63,7 +64,7 @@ const definitionSchema = z.object({
     unit: z.string().optional(),
   }).passthrough()),
 })
-const metricsSchema = z.object({
+const metricResponseSchema = (total: z.ZodNumber) => z.object({
   value: z.array(z.object({
     name: z.object({ value: z.string() }),
     errorCode: z.string().optional(),
@@ -74,17 +75,20 @@ const metricsSchema = z.object({
       })).optional(),
       data: z.array(z.object({
         timeStamp: z.iso.datetime({ offset: true }),
-        total: z.number().finite().nonnegative().refine(Number.isSafeInteger).nullish(),
+        total: total.nullish(),
         average: z.number().finite().nonnegative().nullish(),
       })),
     })),
   })),
 })
+const metricsSchema = metricResponseSchema(z.number().finite().nonnegative().refine(Number.isSafeInteger))
+const foundryCostMetricsSchema = metricResponseSchema(z.number().finite().nonnegative())
 const requiredMetrics = ['InputTokens', 'OutputTokens'] as const
 const tierMetrics = ['ProcessedPromptTokens', 'GeneratedTokens'] as const
 const cacheRateMetric = 'AzureOpenAIContextTokensCacheMatchRate'
 const cacheTokenMetrics = ['cacheReadInputTokens', 'ephemeral5mInputTokens', 'ephemeral1hInputTokens'] as const
-const billingMetricNames = [...requiredMetrics, ...tierMetrics, cacheRateMetric, ...cacheTokenMetrics]
+const foundryCostMetric = 'FoundryModelEstimatedCost'
+const billingMetricNames = [...requiredMetrics, ...tierMetrics, cacheRateMetric, ...cacheTokenMetrics, foundryCostMetric]
 const identityDimensions = ['ModelDeploymentName', 'ModelName', 'ModelVersion']
 const accountType = 'Microsoft.CognitiveServices/accounts'
 const TOP_SERIES = 10000
@@ -278,7 +282,7 @@ export class ArmUsageSource implements UsageSource {
               }
               accountDeployments = next
             }
-            const capabilities = cached && account.modelsMetricDimensions && account.billingMetricCapabilities
+            const capabilities = cached && account.modelsMetricDimensions && account.billingMetricCapabilities?.version === 2
               ? { dimensions: account.modelsMetricDimensions, billing: account.billingMetricCapabilities }
               : await this.metricCapabilities(account.id, signal)
             const dimensions = capabilities.dimensions
@@ -347,7 +351,7 @@ export class ArmUsageSource implements UsageSource {
       'ServiceTierRequest', 'ServiceTierResponse', 'ContextLength', 'ContextType', 'Modality', 'TokenType']
       .filter((name) => relevant.every((item) => item?.dimensions?.some((dimension) => dimension.value === name)))
     const billing: BillingMetricCapabilities = {
-      version: 1,
+      version: 2,
       definitions: definitions.value.filter((item) => billingMetricNames.includes(item.name.value)).map((item) => ({
         name: item.name.value, dimensions: item.dimensions?.map((dimension) => dimension.value) ?? [],
         unit: item.unit ?? null, aggregations: item.supportedAggregationTypes ?? [],
@@ -357,7 +361,7 @@ export class ArmUsageSource implements UsageSource {
   }
 
   private async queryMetrics(accountId: string, names: readonly string[], aggregation: 'Total' | 'Average',
-    window: UsageWindow, dimensions: string[], signal: AbortSignal) {
+    window: UsageWindow, dimensions: string[], signal: AbortSignal, schema = metricsSchema) {
     const url = new URL(`https://management.azure.com${accountId}/providers/microsoft.insights/metrics`)
     url.searchParams.set('api-version', '2023-10-01')
     url.searchParams.set('metricnamespace', accountType)
@@ -369,7 +373,7 @@ export class ArmUsageSource implements UsageSource {
     url.searchParams.set('AutoAdjustTimegrain', 'false')
     url.searchParams.set('top', String(TOP_SERIES))
     url.searchParams.set('$filter', dimensions.map((name) => `${name} eq '*'`).join(' and '))
-    return metricsSchema.parse(await this.get(url.href, signal))
+    return schema.parse(await this.get(url.href, signal))
   }
 
   private async observeAccount(accountId: string, deployments: DeploymentInventory[], window: UsageWindow, dimensions: string[], signal: AbortSignal): Promise<TokenObservation[]> {
@@ -441,6 +445,7 @@ export class ArmUsageSource implements UsageSource {
 
   private async enrichBilling(accountId: string, deployments: DeploymentInventory[], observations: TokenObservation[],
     window: UsageWindow, capabilities: BillingMetricCapabilities, dimensions: string[], signal: AbortSignal) {
+    const retrievedAtUtc = new Date().toISOString()
     const definition = (name: string, required: string[], unit: string, aggregation: string) =>
       capabilities.definitions.find((item) => item.name === name &&
         required.every((dimension) => item.dimensions.includes(dimension)) &&
@@ -456,18 +461,45 @@ export class ArmUsageSource implements UsageSource {
         status: 'unsupported', matchRatePercent: null,
         readTokens: null, write5mTokens: null, write1hTokens: null },
     }
-    const guarded = async (rows: TokenObservation[], code: string, message: string, work: () => Promise<void>, cache = false) => {
+    for (const item of observations) item.foundryEstimatedCost = {
+      metricName: foundryCostMetric, currency: 'USD', status: 'unsupported',
+      costUsd: null, retrievedAtUtc, issue: null,
+    }
+    const guarded = async (rows: TokenObservation[], code: string, message: string, work: () => Promise<void>,
+      failure: 'usage' | 'cache' | 'foundry' = 'usage') => {
       try { await work() }
       catch (error) {
         signal.throwIfAborted()
         const detail = error instanceof UsageReadError ? ` ${error.code}: ${error.message}` : ''
         for (const item of rows) {
-          item.issues.push({ code, message: `${message}${detail}`, resourceId: item.deployment.id })
-          if (cache) item.billingTelemetry!.cache.status = 'failed'
+          const issue = { code, message: `${message}${detail}`, resourceId: item.deployment.id }
+          if (failure === 'foundry') item.foundryEstimatedCost = {
+            metricName: foundryCostMetric, currency: 'USD', status: 'failed',
+            costUsd: null, retrievedAtUtc, issue,
+          }
+          else {
+            item.issues.push(issue)
+            if (failure === 'cache') item.billingTelemetry!.cache.status = 'failed'
+          }
         }
       }
     }
     const tasks: Promise<void>[] = []
+    if (observations.length && definition(foundryCostMetric, identityDimensions, 'Unspecified', 'Total')) {
+      tasks.push(guarded(observations, 'FOUNDRY_ESTIMATED_COST_QUERY_FAILED',
+        'Azure 原生费用读取失败；参考估算独立保留，未填零。', async () => {
+          const metrics = await this.queryMetrics(accountId, [foundryCostMetric], 'Total',
+            window, identityDimensions, signal, foundryCostMetricsSchema)
+          const values = this.supplementalValues(metrics, foundryCostMetric, deployments, window, 'Unspecified', 'total')
+          for (const item of observations) {
+            const value = values.get(item.deployment.name)
+            item.foundryEstimatedCost = {
+              metricName: foundryCostMetric, currency: 'USD', status: value === undefined ? 'noData' : 'available',
+              costUsd: value === undefined ? null : new Decimal(value).toFixed(12), retrievedAtUtc, issue: null,
+            }
+          }
+        }, 'foundry'))
+    }
     const tierDefinitions = tierMetrics.map((name) =>
       definition(name, ['ModelDeploymentName', 'ModelVersion', 'ServiceTierResponse'], 'Count', 'Total'))
     const tierRows = openai.filter((item) => item.billingTelemetry!.tierSource === 'unknown' &&
@@ -504,10 +536,10 @@ export class ArmUsageSource implements UsageSource {
         const values = this.supplementalValues(metrics, cacheRateMetric, deployments, window, 'Percent', 'average')
         for (const item of openai) {
           const value = values.get(item.deployment.name)
-          item.billingTelemetry!.cache.matchRatePercent = value === undefined ? null : String(value)
+          item.billingTelemetry!.cache.matchRatePercent = value === undefined ? null : new Decimal(value).toFixed()
           item.billingTelemetry!.cache.status = value === undefined ? 'noData' : 'available'
         }
-      }, true))
+      }, 'cache'))
     }
     const cacheDefinitions = cacheTokenMetrics.map((name) => definition(name, identityDimensions, 'Count', 'Total'))
     const cacheNames = cacheTokenMetrics.filter((_, index) => cacheDefinitions[index] !== undefined)
@@ -527,13 +559,13 @@ export class ArmUsageSource implements UsageSource {
           cache.write1hTokens = write1h === undefined ? null : String(write1h)
           cache.status = [read, write5m, write1h].some((value) => value !== undefined) ? 'available' : 'noData'
         }
-      }, true))
+      }, 'cache'))
     }
     await Promise.all(tasks)
   }
 
   private supplementalValues(metrics: z.infer<typeof metricsSchema>, name: string, deployments: DeploymentInventory[],
-    window: UsageWindow, unit: 'Count' | 'Percent', aggregation: 'total' | 'average') {
+    window: UsageWindow, unit: 'Count' | 'Percent' | 'Unspecified', aggregation: 'total' | 'average') {
     const metric = metrics.value.find((item) => item.name.value === name)
     if (!metric || (metric.errorCode && metric.errorCode !== 'Success') || (metric.unit && metric.unit !== unit)) {
       throw new UsageReadError('CACHE_METRIC_INVALID', `缓存指标 ${name} 失败或单位不符。`)

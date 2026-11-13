@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { Decimal } from 'decimal.js'
 import {
   DeploymentUsageSchema, HourlyUsageSchema, PricingSnapshotSchema,
   type RetailPriceItem, type TokenObservation, type UsagePriceBook,
@@ -70,17 +71,17 @@ describe('model-independent official billing', () => {
     expect(DeploymentUsageSchema.parse(result)).toEqual(result)
   })
 
-  it('returns a bounded official estimate when aggregated metrics cannot identify short/long request contexts', () => {
+  it('prices the reference as equal short/long contexts instead of choosing price extrema', () => {
     const result = calculateDeploymentCost(observation(), contextBook(), window)
-    expect(result).toMatchObject({ costUsd: '16.000000000000', costUpperUsd: '28.000000000000',
-      pricingStatus: 'range', pricingUncertainty: ['context'], issues: [] })
+    expect(result).toMatchObject({ costUsd: '22.000000000000', costUpperUsd: '22.000000000000',
+      pricingStatus: 'matched', pricingUncertainty: ['context'], issues: [] })
     expect(result.prices).toEqual(expect.arrayContaining([
-      expect.objectContaining({ context: 'short', bound: 'lower' }),
-      expect.objectContaining({ context: 'long', bound: 'upper' }),
+      expect.objectContaining({ context: 'short', bound: 'both' }),
+      expect.objectContaining({ context: 'long', bound: 'both' }),
     ]))
   })
 
-  it('uses explicit metric context slices without equating the hourly token total to any single request context', () => {
+  it('keeps actual context slices intact while using the declared fixed reference scenario', () => {
     const item = observation()
     item.billingSlices = [
       { direction: 'input', tokens: '250000', context: 'short', modality: null, tier: 'standard' },
@@ -89,7 +90,16 @@ describe('model-independent official billing', () => {
       { direction: 'output', tokens: '1500000', context: 'long', modality: null, tier: 'standard' },
     ]
     const result = calculateDeploymentCost(item, contextBook(), window)
-    expect(result).toMatchObject({ costUsd: '25.000000000000', costUpperUsd: '25.000000000000', pricingStatus: 'matched' })
+    expect(result).toMatchObject({ costUsd: '22.000000000000', costUpperUsd: '22.000000000000', pricingStatus: 'matched' })
+    expect(result.billingSlices).toEqual(item.billingSlices)
+  })
+
+  it('does not truncate odd token quantities when allocating the two context halves', () => {
+    const item = { ...observation(), inputTokens: '1', outputTokens: '3' }
+    const result = calculateDeploymentCost(item, contextBook(), window)
+    expect(result).toMatchObject({ costUsd: '0.000031500000', costUpperUsd: '0.000031500000' })
+    expect(result.inputTokens).toBe('1')
+    expect(result.outputTokens).toBe('3')
   })
 
   it('activates already-downloaded scheduled prices at their effective hour, not early and not one daily sync late', () => {
@@ -270,7 +280,7 @@ describe('model-independent official billing', () => {
     const value = book([meter(30, '9 Orion Inp Gl', 2), meter(31, '9 Orion Opt Gl', 7), meter(32, '9 Orion Cd Wr Gl', 2.5)])
     const item = observation()
     expect(calculateDeploymentCost(item, value, window)).toMatchObject({
-      costUsd: '16.000000000000', costUpperUsd: '18.500000000000', pricingStatus: 'range', pricingUncertainty: ['cacheWrite'],
+      costUsd: '16.000000000000', costUpperUsd: '16.500000000000', pricingStatus: 'range', pricingUncertainty: ['cacheWrite'],
     })
     item.cacheWriteTokens = '100000'
     expect(calculateDeploymentCost(item, value, window)).toMatchObject({
@@ -282,6 +292,174 @@ describe('model-independent official billing', () => {
     const invalid = calculateDeploymentCost(item, value, window)
     expect(invalid.costUsd).toBeNull()
     expect(invalid.issues[0]?.code).toBe('CACHE_WRITE_COUNT_INVALID')
+  })
+})
+
+describe('hourly cache-ratio estimation', () => {
+  const prices = () => book([
+    meter(70, '9 Orion Inp Gl', 2), meter(71, '9 Orion Opt Gl', 7),
+    meter(72, '9 Orion Cd Inp Gl', 0.2), meter(73, '9 Orion Cd Wr Gl', 2.5),
+  ])
+  const cached = (percent: string | null = '25'): TokenObservation => ({
+    ...observation(), billingTelemetry: {
+      tierSource: 'unknown', cache: { source: 'openai-cache-match-rate',
+        status: percent === null ? 'noData' : 'available', matchRatePercent: percent,
+        readTokens: null, write5mTokens: null, write1hTokens: null },
+    },
+  })
+
+  it('weights cached reads and known writes by context without charging ordinary input twice', () => {
+    const value = book([
+      meter(90, '9 Orion ShortCo Inp Std Gl', 2), meter(91, '9 Orion ShortCo Opt Std Gl', 7),
+      meter(92, '9 Orion ShortCo Cd Inp Std Gl', 0.2), meter(93, '9 Orion ShortCo Cd Wr Std Gl', 2.5),
+      meter(94, '9 Orion LongCo Inp Std Gl', 4), meter(95, '9 Orion LongCo Opt Std Gl', 12),
+      meter(96, '9 Orion LongCo Cd Inp Std Gl', 0.4), meter(97, '9 Orion LongCo Cd Wr Std Gl', 5),
+    ])
+    const item = { ...cached('25'), inputTokens: '100', outputTokens: '0' }
+    expect(calculateDeploymentCost(item, value, window)).toMatchObject({
+      costUsd: '0.000232500000', costUpperUsd: '0.000288750000',
+    })
+    const known = calculateDeploymentCost({ ...item, cacheWriteTokens: '10' }, value, window)
+    expect(known).toMatchObject({ costUsd: '0.000240000000', costUpperUsd: '0.000240000000' })
+    expect(known.billingTelemetry).toEqual(item.billingTelemetry)
+  })
+
+  describe('independent native hourly cost', () => {
+    it('sums complete native coverage but never presents missing deployments or subscriptions as a full amount', () => {
+      const item = observation()
+      item.foundryEstimatedCost = {
+        metricName: 'FoundryModelEstimatedCost', currency: 'USD', status: 'available',
+        costUsd: '2.855756600000', retrievedAtUtc: now.toISOString(), issue: null,
+      }
+      const first = calculateDeploymentCost(item, contextBook(), window)
+      const second = calculateDeploymentCost({
+        ...item, deployment: { ...item.deployment, id: '/fixture/second', name: 'second' },
+        foundryEstimatedCost: { ...item.foundryEstimatedCost, costUsd: '0.606792000000' },
+      }, contextBook(), window)
+      expect(summarizeUsageCosts([first, second], [], 1, 1, false).foundryEstimatedCost)
+        .toMatchObject({ status: 'available', costUsd: '3.462548600000' })
+      const missing = { ...second, foundryEstimatedCost: { ...item.foundryEstimatedCost, status: 'noData' as const, costUsd: null } }
+      const partial = summarizeUsageCosts([first, missing], [], 1, 1, false)
+      expect(partial.foundryEstimatedCost).toMatchObject({ status: 'partial', costUsd: null })
+      expect(partial.status).toBe('complete')
+      expect(summarizeUsageCosts([first, second], [], 0, 1, false).foundryEstimatedCost)
+        .toMatchObject({ status: 'partial', costUsd: null })
+    })
+  })
+
+  it('splits input by the observed ratio, uses the cached price and does not fabricate measured counters', () => {
+    const item = cached()
+    const result = calculateDeploymentCost(item, prices(), window)
+    expect(result).toMatchObject({
+      costUsd: '15.550000000000', costUpperUsd: '15.925000000000', pricingStatus: 'range',
+      pricingUncertainty: ['cacheRead', 'cacheWrite'],
+      cacheReadEstimate: { method: 'hourly-match-rate', matchRatePercent: '25',
+        estimatedReadTokens: '250000', estimatedNonCachedInputTokens: '750000', tierAllocation: 'same-ratio-per-tier' },
+    })
+    expect(result.billingTelemetry).toEqual(item.billingTelemetry)
+    expect(result.billingTelemetry!.cache.readTokens).toBeNull()
+    expect(result.prices).toEqual(expect.arrayContaining([
+      expect.objectContaining({ direction: 'cachedInput', unitPriceUsd: '0.2', tier: 'standard' }),
+      expect.objectContaining({ direction: 'cacheWrite', unitPriceUsd: '2.5', bound: 'upper' }),
+    ]))
+    expect(DeploymentUsageSchema.parse(result)).toEqual(result)
+  })
+
+  it.each([
+    ['0', '16.000000000000', '16.500000000000', '0'],
+    ['100', '14.200000000000', '14.200000000000', '1000000'],
+  ])('handles %s percent without allocating the same input to cache reads and writes', (percent, lower, upper, reads) => {
+    const result = calculateDeploymentCost(cached(percent), prices(), window)
+    expect(result.costUsd).toBe(lower)
+    expect(result.costUpperUsd).toBe(upper)
+    expect(result.cacheReadEstimate!.estimatedReadTokens).toBe(reads)
+  })
+
+  it('keeps fractional estimated tokens through pricing rather than rounding them into an exact count', () => {
+    const result = calculateDeploymentCost({
+      ...cached('0.8065233094404624'), inputTokens: '7034', outputTokens: '0', cacheWriteTokens: '0',
+    }, prices(), window)
+    expect(result.cacheReadEstimate).toMatchObject({
+      estimatedReadTokens: '56.730849586042125216', estimatedNonCachedInputTokens: '6977.269150413957874784',
+    })
+    expect(result.costUsd).toBe('0.013965884471')
+    expect(result.costUpperUsd).toBe(result.costUsd)
+  })
+
+  it('replaces only noncached ordinary input for a known write count', () => {
+    const result = calculateDeploymentCost({ ...cached(), cacheWriteTokens: '100000' }, prices(), window)
+    expect(result).toMatchObject({ costUsd: '15.600000000000', costUpperUsd: '15.600000000000',
+      pricingStatus: 'matched', pricingUncertainty: ['cacheRead'] })
+  })
+
+  it.each(['750001', '-1', '0.5'])('rejects invalid or overlapping write quantities %s', (cacheWriteTokens) => {
+    const result = calculateDeploymentCost({ ...cached(), cacheWriteTokens }, prices(), window)
+    expect(result.costUsd).toBeNull()
+    expect(result.issues[0]?.code).toBe('CACHE_WRITE_COUNT_INVALID')
+  })
+
+  it.each(['-1', '100.1', 'NaN'])('rejects invalid cache rates %s explicitly', (percent) => {
+    const result = calculateDeploymentCost(cached(percent), prices(), window)
+    expect(result.costUsd).toBeNull()
+    expect(result.issues[0]?.code).toBe('CACHE_MATCH_RATE_INVALID')
+  })
+
+  it.each(['noData', 'failed', 'unsupported'] as const)('does not turn a %s ratio into a measured zero or apply a discount', (status) => {
+    const item = cached(null)
+    item.billingTelemetry!.cache.status = status
+    const result = calculateDeploymentCost(item, prices(), window)
+    expect(result.cacheReadEstimate).toBeUndefined()
+    expect(result.costUsd).toBe('16.000000000000')
+    expect(result.prices.some((price) => price.direction === 'cachedInput')).toBe(false)
+  })
+
+  it('preserves a partial known subtotal and unknown upper bound when the discounted read price is missing', () => {
+    const value = book([meter(70, '9 Orion Inp Gl', 2), meter(71, '9 Orion Opt Gl', 7)])
+    const result = calculateDeploymentCost(cached(), value, window)
+    expect(result).toMatchObject({ costUsd: '15.500000000000', costUpperUsd: null, pricingStatus: 'missing' })
+    expect(result.issues[0]?.code).toBe('CACHE_READ_PRICE_MISSING')
+    expect(calculateDeploymentCost(cached('0'), value, window).issues).toEqual([])
+    const writes = calculateDeploymentCost({ ...cached('0'), cacheWriteTokens: '1' }, value, window)
+    expect(writes.costUsd).toBeNull()
+    expect(writes.issues[0]?.code).toBe('CACHE_WRITE_PRICE_MISSING')
+  })
+
+  it('uses the deployment ratio per actual tier and the fixed context mix for cache-write bounds', () => {
+    const value = book([
+      meter(70, '9 Orion Inp Gl', 2), meter(71, '9 Orion Opt Gl', 7), meter(72, '9 Orion Cd Inp Gl', 0.2),
+      meter(73, '9 Orion Cd Wr Gl', 2.5), meter(74, '9 Orion Inp Priority Gl', 6),
+      meter(75, '9 Orion Opt Priority Gl', 21), meter(76, '9 Orion Cd Inp Priority Gl', 0.6),
+      meter(77, '9 Orion Cd Wr Priority Gl', 7.5), meter(78, '9 Orion LongCo Cd Wr Priority Gl', 100),
+    ])
+    const item = cached('20')
+    item.billingSlices = [
+      { direction: 'input', tokens: '400000', tier: 'standard', context: 'short', modality: null },
+      { direction: 'input', tokens: '600000', tier: 'priority', context: 'short', modality: null },
+      { direction: 'output', tokens: '800000', tier: 'standard', context: 'short', modality: null },
+      { direction: 'output', tokens: '1200000', tier: 'priority', context: 'short', modality: null },
+    ]
+    expect(calculateDeploymentCost(item, value, window)).toMatchObject({
+      costUsd: '34.408000000000', costUpperUsd: '57.488000000000',
+    })
+    expect(calculateDeploymentCost({ ...item, cacheWriteTokens: '100000' }, value, window)).toMatchObject({
+      costUsd: '34.458000000000', costUpperUsd: '39.183000000000',
+    })
+    const incomplete = { ...value, official: { ...value.official!,
+      rates: value.official!.rates.filter((price) => price.direction !== 'cachedInput' || price.tier !== 'priority') } }
+    expect(calculateDeploymentCost(item, incomplete, window).issues[0]?.code).toBe('CACHE_READ_PRICE_MISSING')
+  })
+
+  it('bounds every write allocation under the same cache-ratio assumption', () => {
+    const item = { ...cached('25'), inputTokens: '20', outputTokens: '0' }
+    for (let writes = 0; writes <= 15; writes += 1) {
+      const actual = new Decimal(15 - writes).times(2).plus(1).plus(new Decimal(writes).times(2.5)).div(1000000)
+      const unknown = calculateDeploymentCost(item, prices(), window)
+      const known = calculateDeploymentCost({ ...item, cacheWriteTokens: String(writes) }, prices(), window)
+      expect(new Decimal(unknown.costUsd!).lte(actual)).toBe(true)
+      expect(new Decimal(unknown.costUpperUsd!).gte(actual)).toBe(true)
+      expect(new Decimal(known.costUsd!).eq(actual)).toBe(true)
+      expect(known.costUpperUsd).toBe(known.costUsd)
+    }
   })
 })
 
@@ -302,8 +480,8 @@ describe('safe historical repricing and threshold envelopes', () => {
   it('reprices only previously missing provisional amounts using the original snapshot while preserving observed tokens, window, collection time and threshold', () => {
     const before = hour()
     const after = repriceMissingUsageHour(before, contextBook(), now)
-    expect(after).toMatchObject({ knownCostUsd: '16.000000000000', knownCostUpperUsd: '28.000000000000',
-      status: 'complete', pricingRuleVersion: 3, issues: [], repricedAtUtc: now.toISOString(),
+    expect(after).toMatchObject({ knownCostUsd: '22.000000000000', knownCostUpperUsd: '22.000000000000',
+      status: 'complete', pricingRuleVersion: 5, issues: [], repricedAtUtc: now.toISOString(),
       collectedAtUtc: before.collectedAtUtc, thresholdUsd: before.thresholdUsd,
       inputTokens: before.inputTokens, outputTokens: before.outputTokens, priceSnapshotId: before.priceSnapshotId })
     expect(HourlyUsageSchema.parse(after)).toEqual(after)
@@ -352,13 +530,16 @@ describe('safe historical repricing and threshold envelopes', () => {
     })
   })
 
-  it('retains the conservative cache-read estimate instead of multiplying an average percentage by tokens', () => {
+  it('keeps the raw percentage separate from the estimate and does not invent a missing discounted price', () => {
     const item: TokenObservation = { ...observation(), billingTelemetry: {
       tierSource: 'unknown', cache: { source: 'openai-cache-match-rate', status: 'available', matchRatePercent: '99',
         readTokens: null, write5mTokens: null, write1hTokens: null },
     } }
     const result = calculateDeploymentCost(item, contextBook(), window)
-    expect(result.costUsd).toBe('16.000000000000')
+    expect(result.costUsd).toBe('19.030000000000')
+    expect(result.costUpperUsd).toBeNull()
+    expect(result.issues[0]?.code).toBe('CACHE_READ_PRICE_MISSING')
+    expect(result.cacheReadEstimate!.estimatedReadTokens).toBe('990000')
     expect(result.prices.some((price) => price.direction === 'cacheWrite')).toBe(false)
     expect(result.billingTelemetry).toEqual(item.billingTelemetry)
     const before = hour()
@@ -392,5 +573,20 @@ describe('safe historical repricing and threshold envelopes', () => {
     expect(evaluateAlertHour(breach.next, next, null, true).kinds).toEqual([])
     expect(evaluateAlertHour(breach.next, { ...next, knownCostUpperUsd: null }, null, true).kinds).toEqual([])
     expect(evaluateAlertHour(breach.next, { ...next, knownCostUpperUsd: '1.00' }, null, true).kinds).toEqual(['cost-recovered'])
+  })
+
+  it('compares the ratio-adjusted amount rather than the old undiscounted input estimate to the alert threshold', () => {
+    const item = { ...observation(), billingTelemetry: {
+      tierSource: 'unknown' as const, cache: { source: 'openai-cache-match-rate' as const, status: 'available' as const,
+        matchRatePercent: '25', readTokens: null, write5mTokens: null, write1hTokens: null },
+    } }
+    const costs = calculateDeploymentCost(item, book([
+      meter(70, '9 Orion Inp Gl', 2), meter(71, '9 Orion Opt Gl', 7),
+      meter(72, '9 Orion Cd Inp Gl', 0.2), meter(73, '9 Orion Cd Wr Gl', 2.5),
+    ]), window)
+    expect(evaluateAlertHour(initialAlertState(), { ...hour(), status: 'complete', thresholdUsd: '15.7',
+      knownCostUsd: costs.costUsd, knownCostUpperUsd: costs.costUpperUsd }, null, true).kinds).toEqual([])
+    expect(evaluateAlertHour(initialAlertState(), { ...hour(), status: 'complete', thresholdUsd: '15.5',
+      knownCostUsd: costs.costUsd, knownCostUpperUsd: costs.costUpperUsd }, null, true).kinds).toEqual(['cost-exceeded'])
   })
 })

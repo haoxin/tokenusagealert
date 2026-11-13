@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CompactPriceCatalogSchema, type ResourceInventory, type SubscriptionInventoryDocument, type UsagePriceBook } from '@tokenusagealert/schemas'
+import {
+  BillingTelemetrySchema, CompactPriceCatalogSchema, DeploymentUsageSchema,
+  type ResourceInventory, type SubscriptionInventoryDocument, type UsagePriceBook,
+} from '@tokenusagealert/schemas'
 import { calculateDeploymentCost, evaluateAlertHour, initialAlertState, summarizeUsageCosts } from '@tokenusagealert/domain'
 import { ArmUsageSource } from './usage-source.js'
 
@@ -24,7 +27,11 @@ interface Options {
   requestOnly?: boolean
   directTier?: boolean
   missingResponse?: boolean
-  fail?: 'tier' | 'cache'
+  fail?: 'tier' | 'cache' | 'cost'
+  cost?: boolean
+  costValue?: number
+  costUnit?: string
+  emptyCost?: boolean
   emptyCache?: boolean
   rateValue?: number
   rateUnit?: string
@@ -74,6 +81,10 @@ function fixture(options: Options = {}) {
       if (options.counts) definitions.push(...['cacheReadInputTokens', 'ephemeral5mInputTokens', 'ephemeral1hInputTokens'].map((name) => ({
         name: { value: name }, unit: 'Count', supportedAggregationTypes: ['Total'], dimensions: identity.map((value) => ({ value })),
       })))
+      if (options.cost) definitions.push({
+        name: { value: 'FoundryModelEstimatedCost' }, unit: 'Unspecified', supportedAggregationTypes: ['Total'],
+        dimensions: identity.map((value) => ({ value })),
+      })
       return Response.json({ value: definitions })
     }
     if (!url.pathname.endsWith('/metrics')) throw new Error('Resource discovery must remain cached.')
@@ -82,8 +93,10 @@ function fixture(options: Options = {}) {
     expect(url.searchParams.get('metricnamespace')).toBe('Microsoft.CognitiveServices/accounts')
     const names = url.searchParams.get('metricnames')!.split(',')
     const legacy = names.includes('ProcessedPromptTokens')
-    const cache = !legacy && !names.includes('InputTokens')
-    if ((legacy && options.fail === 'tier') || (cache && options.fail === 'cache')) return new Response(null, { status: 403 })
+    const cost = names.includes('FoundryModelEstimatedCost')
+    const cache = !legacy && !cost && !names.includes('InputTokens')
+    if ((legacy && options.fail === 'tier') || (cache && options.fail === 'cache') ||
+      (cost && options.fail === 'cost')) return new Response(null, { status: 403 })
     return Response.json({ value: names.map((name) => {
       const rate = name === 'AzureOpenAIContextTokensCacheMatchRate'
       const output = name === 'OutputTokens' || name === 'GeneratedTokens'
@@ -94,7 +107,7 @@ function fixture(options: Options = {}) {
         { metadatavalues: metadata(true, options.missingResponse ? undefined : options.responseTier ?? 'priority'),
           data: points(output ? 12 : options.mismatch ? 59 : 60) },
       ] : [{ metadatavalues: metadata(false, options.directTier ? 'priority' : undefined),
-        data: points(rate ? options.rateValue ?? 42.5 : name === 'cacheReadInputTokens'
+        data: points(cost ? options.costValue ?? 2.855756600000002 : rate ? options.rateValue ?? 42.5 : name === 'cacheReadInputTokens'
           ? options.unsafeCount ? Number.MAX_SAFE_INTEGER + 1 : 60
           : name === 'ephemeral5mInputTokens' ? 4 : name === 'ephemeral1hInputTokens' ? 6 : output ? 20 : 100) }]
       if (cache && options.wrongCacheVersion) {
@@ -102,8 +115,8 @@ function fixture(options: Options = {}) {
       }
       if (cache && options.nullCache) series[0]!.data = [{ timeStamp: window.windowStartUtc }]
       if (options.duplicate && cache) series.push(structuredClone(series[0]!))
-      return { name: { value: name }, unit: rate ? options.rateUnit ?? 'Percent' : 'Count', errorCode: 'Success',
-        timeseries: cache && options.emptyCache ? [] : cache && options.truncatedCache
+      return { name: { value: name }, unit: cost ? options.costUnit ?? 'Unspecified' : rate ? options.rateUnit ?? 'Percent' : 'Count', errorCode: 'Success',
+        timeseries: cost && options.emptyCost || cache && options.emptyCache ? [] : cache && options.truncatedCache
           ? Array.from({ length: 10000 }, () => series[0]!) : series }
     }) })
   })
@@ -113,16 +126,56 @@ function fixture(options: Options = {}) {
 }
 
 describe('same-hour served tier and provider-specific cache telemetry', () => {
-  it('carries real source tier slices through retail estimation, hourly aggregation and the existing cost alert', async () => {
+  it.each([
+    [2.855756600000002, '2.855756600000'],
+    [0.0000001, '0.000000100000'],
+  ])('reads native USD %s independently without token rounding or exponent strings', async (costValue, costUsd) => {
+    const result = await fixture({ cost: true, costValue }).collect()
+    expect(result.observations[0]).toMatchObject({
+      inputTokens: '100', outputTokens: '20', issues: [],
+      foundryEstimatedCost: { metricName: 'FoundryModelEstimatedCost', currency: 'USD',
+        status: 'available', costUsd, issue: null },
+    })
+  })
+
+  it.each([
+    [{ emptyCost: true }, 'noData'],
+    [{ fail: 'cost' as const }, 'failed'],
+    [{ costUnit: 'Count' }, 'failed'],
+  ])('preserves unknown native cost and reference inputs for %j', async (options, status) => {
+    const result = await fixture({ cost: true, ...options }).collect()
+    const row = result.observations[0]!
+    expect(row).toMatchObject({ inputTokens: '100', outputTokens: '20', metricsStatus: 'success', issues: [],
+      foundryEstimatedCost: { status, costUsd: null } })
+    if (status === 'failed') expect(row.foundryEstimatedCost?.issue?.code).toBe('FOUNDRY_ESTIMATED_COST_QUERY_FAILED')
+  })
+
+  it('refreshes a version-one capability cache before reading the newly supported native metric', async () => {
+    const f = fixture({ cost: true })
+    f.inventory.accounts[0]!.billingMetricCapabilities = { version: 1, definitions: [] }
+    const result = await f.collect()
+    expect(result.inventory.accounts[0]?.billingMetricCapabilities).toMatchObject({ version: 2 })
+    expect(f.requests[0]?.pathname).toContain('/metricDefinitions')
+    expect(result.observations[0]?.foundryEstimatedCost?.status).toBe('available')
+  })
+
+  it.each([true, false])('carries source cache and tier slices through estimation and alerts (cached prices available: %s)', async (cachedPrices) => {
     const collected = await fixture({ tier: true, rate: true }).collect()
+    const rates = [
+      ['input', 'standard', '2'], ['output', 'standard', '7'],
+      ['input', 'priority', '6'], ['output', 'priority', '21'],
+      ...cachedPrices ? [
+        ['cachedInput', 'standard', '0.2'], ['cachedInput', 'priority', '0.6'],
+        ['cacheWrite', 'standard', '2.5'], ['cacheWrite', 'priority', '7.5'],
+      ] : [],
+    ]
     const book: UsagePriceBook = {
       kind: 'usage-price-book',
       official: CompactPriceCatalogSchema.parse({
         schemaVersion: 2, kind: 'compact-official', snapshotId: tenant, fetchedAtUtc: window.windowStartUtc,
         generatedAtUtc: window.windowStartUtc, currency: 'USD', unitTokens: '1000000',
-        models: ['gpt-fixture'], regions: ['swedencentral'], rawEntryCount: 4,
-        rates: [['input', 'standard', '2'], ['output', 'standard', '7'],
-          ['input', 'priority', '6'], ['output', 'priority', '21']].map(([direction, tier, usd], index) => ({
+        models: ['gpt-fixture'], regions: ['swedencentral'], rawEntryCount: rates.length,
+        rates: rates.map(([direction, tier, usd], index) => ({
           model: 'gpt-fixture', skuName: `fixture ${direction} ${tier} Gl`, sku: 'GlobalStandard',
           direction, tier, usd, context: 'uniform', modality: 'text', modelVersion: null, approvedMapping: true,
           effectiveFromUtc: '2026-01-01T00:00:00Z',
@@ -132,15 +185,31 @@ describe('same-hour served tier and provider-specific cache telemetry', () => {
       manual: { schemaVersion: 1, revision: 0, snapshotId: null, versions: [] },
     }
     const priced = calculateDeploymentCost(collected.observations[0]!, book, window.windowStartUtc)
-    expect(priced).toMatchObject({ costUsd: '0.000748000000', costUpperUsd: '0.000748000000', pricingStatus: 'matched' })
+    expect(priced).toMatchObject({
+      costUsd: cachedPrices ? '0.000579700000' : '0.000561000000',
+      costUpperUsd: cachedPrices ? '0.000642950000' : null,
+      pricingStatus: cachedPrices ? 'range' : 'missing',
+      cacheReadEstimate: { method: 'hourly-match-rate', matchRatePercent: '42.5',
+        estimatedReadTokens: '42.5', estimatedNonCachedInputTokens: '57.5', tierAllocation: 'same-ratio-per-tier' },
+    })
+    expect(DeploymentUsageSchema.parse(priced)).toEqual(priced)
+    if (cachedPrices) {
+      expect(priced.issues).toEqual([])
+      expect(priced.prices.filter((price) => price.direction === 'cachedInput').map((price) => price.tier).sort())
+        .toEqual(['priority', 'standard'])
+    } else {
+      expect(priced.issues.map((issue) => issue.code)).toEqual(Array(4).fill('CACHE_READ_PRICE_MISSING'))
+    }
     const summary = summarizeUsageCosts([priced], priced.issues, 1, 1, false)
-    expect(summary.status).toBe('complete')
-    const decision = evaluateAlertHour(initialAlertState(), {
+    expect(summary.status).toBe(cachedPrices ? 'complete' : 'partial')
+    const hour = {
       ...window, status: summary.status, knownCostUsd: summary.knownCostUsd,
       knownCostUpperUsd: summary.knownCostUpperUsd, thresholdUsd: '0.0005',
-    }, null, true)
-    expect(decision.kinds).toEqual(['cost-exceeded'])
+    }
+    expect(evaluateAlertHour(initialAlertState(), hour, null, true).kinds).toEqual(['cost-exceeded'])
+    expect(evaluateAlertHour(initialAlertState(), { ...hour, thresholdUsd: '0.0006' }, null, true).kinds).toEqual([])
     expect(priced.billingTelemetry!.cache.matchRatePercent).toBe('42.5')
+    expect(priced.billingTelemetry!.cache.readTokens).toBeNull()
   })
 
   it('replaces only verified billing slices without adding legacy token totals to Models', async () => {
@@ -205,6 +274,16 @@ describe('same-hour served tier and provider-specific cache telemetry', () => {
     const request = f.requests.find((url) => url.searchParams.get('aggregation') === 'Average')!
     expect(request.searchParams.get('$filter')).toBe(identity.map((name) => `${name} eq '*'`).join(' and '))
     expect(result.observations[0]!.inputTokens).toBe('100')
+  })
+
+  it.each([
+    [0.0000001, '0.0000001'],
+    [0.0000001234567890123456, '0.0000001234567890123456'],
+  ] as const)('preserves a small cache percentage %s in the persisted decimal contract', async (rateValue, expected) => {
+    const result = await fixture({ rate: true, rateValue }).collect()
+    const telemetry = BillingTelemetrySchema.parse(result.observations[0]!.billingTelemetry)
+    expect(telemetry.cache).toMatchObject({ status: 'available', matchRatePercent: expected, readTokens: null })
+    expect(result.observations[0]!.issues).toEqual([])
   })
 
   it('keeps zero-percent cache observations distinct from unavailable or empty data', async () => {

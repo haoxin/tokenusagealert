@@ -1,11 +1,11 @@
 import { BlobServiceClient, type ContainerClient } from '@azure/storage-blob'
 import {
-  BillingMetricCapabilitiesSchema, HourlyUsageSchema, ResourceInventorySchema, TenantDailyUsageSchema, TenantIdSchema, UsageRunSchema, UsageShardViewSchema,
+  BillingMetricCapabilitiesSchema, FoundryEstimatedCostSchema, HourlyUsageSchema, ResourceInventorySchema, TenantDailyUsageSchema, TenantIdSchema, UsageRunSchema, UsageShardViewSchema,
   type HourlyUsage, type ResourceInventory, type UsageRun, type TenantDailyUsage, type UsageShardView,
-  type UsagePriceBook,
+  type FoundryEstimatedCost, type UsageOverviewRow, type UsagePriceBook,
 } from '@tokenusagealert/schemas'
-import { businessDate, mapConcurrent, repriceMissingUsageHour, USAGE_RETENTION_MS } from '@tokenusagealert/domain'
-import { randomUUID } from 'node:crypto'
+import { businessDate, mapConcurrent, overviewHour, repriceMissingUsageHour, repriceUsageHourForContextMix, USAGE_RETENTION_MS } from '@tokenusagealert/domain'
+import { createHash, randomUUID } from 'node:crypto'
 import { storageErrorCode, withBlobLease } from './blob-lease.js'
 import { z } from 'zod'
 
@@ -179,6 +179,123 @@ export class BlobUsageStore {
       action: 'usage.missing-price.repriced', actor, occurredAtUtc: new Date().toISOString(), hour: repriced,
     }, null, signal)
     return { changed: true, before: original, hour: repriced, auditId }
+  }
+
+  async backfillContextEstimates(
+    id: string,
+    requests: Array<{ windowStartUtc: string; estimates: Record<string, FoundryEstimatedCost> }>,
+    book: UsagePriceBook,
+    actor: string,
+    signal: AbortSignal,
+  ) {
+    const tenantId = TenantIdSchema.parse(id)
+    if (!actor.trim()) throw new Error('Context-estimate backfill requires an audit actor.')
+    if (requests.length === 0 || requests.length > 24) throw new Error('Supply only explicit retained context-estimate hours.')
+    const starts = requests.map((request) => Date.parse(request.windowStartUtc))
+    if (new Set(starts).size !== starts.length || starts.some((start) => !Number.isFinite(start) ||
+      start % 3_600_000 !== 0 || start + 3_600_000 > Date.now() ||
+      start + 3_600_000 <= Date.now() - USAGE_RETENTION_MS)) {
+      throw new Error('Context-estimate backfill requires distinct retained, completed natural hours.')
+    }
+    const dates = new Set(requests.map((request) => businessDate(request.windowStartUtc)))
+    if (dates.size !== 1) throw new Error('A context-estimate commit must target only one business day.')
+    const date = [...dates][0]!
+    const name = `tenants/${tenantId}/${date.replaceAll('-', '/')}.json`
+    const stored = await this.read(this.usage, name)
+    if (!stored) throw new Error('The requested persisted usage day does not exist.')
+    const day = TenantDailyUsageSchema.parse(stored.data)
+    if (day.tenantId !== tenantId || day.businessDate !== date) throw new Error('Stored usage does not match the requested tenant/day.')
+    const comparable = (hour: HourlyUsage) => JSON.stringify({
+      policy: hour.estimatePolicy, version: hour.pricingRuleVersion,
+      cost: hour.knownCostUsd, upper: hour.knownCostUpperUsd, native: hour.foundryEstimatedCost?.costUsd,
+      breakdown: hour.breakdown.map((row) => ({
+        id: row.deployment.id, cost: row.costUsd, upper: row.costUpperUsd,
+        scenario: row.contextMixEstimate, prices: row.prices, native: row.foundryEstimatedCost?.costUsd,
+      })),
+    })
+    const auditId = randomUUID()
+    const originals: HourlyUsage[] = []
+    let proposed = requests.map((request, index) => {
+      const original = day.hours.find((hour) => Date.parse(hour.windowStartUtc) === starts[index])
+      if (!original) throw new Error('A requested persisted usage hour does not exist.')
+      originals.push(original)
+      const entries = Object.entries(request.estimates)
+      const estimates = new Map(entries.map(([deploymentId, estimate]) =>
+        [deploymentId.toLowerCase(), FoundryEstimatedCostSchema.parse(estimate)]))
+      const expected = new Set(original.breakdown.map((row) => row.deployment.id.toLowerCase()))
+      if (estimates.size !== entries.length || expected.size !== original.breakdown.length ||
+        estimates.size !== expected.size || [...estimates.keys()].some((key) => !expected.has(key)) ||
+        [...estimates.values()].some((estimate) => estimate.status !== 'available' || estimate.costUsd === null)) {
+        throw new Error('Backfill requires complete native estimates for exactly the stored deployments.')
+      }
+      const updated = HourlyUsageSchema.parse({
+        ...repriceUsageHourForContextMix({
+          ...original, breakdown: original.breakdown.map((row) => ({
+            ...row, foundryEstimatedCost: estimates.get(row.deployment.id.toLowerCase())!,
+          })),
+        }, book),
+        comparisonBackfillAuditId: auditId,
+      })
+      if (updated.foundryEstimatedCost?.status !== 'available') throw new Error('Native estimate coverage is incomplete; history was not changed.')
+      return comparable(updated) === comparable(original) ? original : updated
+    })
+    const changed = proposed.some((hour, index) => hour !== originals[index])
+    if (changed) proposed = proposed.map((hour) => ({ ...hour, comparisonBackfillAuditId: auditId }))
+    const byStart = new Map(proposed.map((hour) => [Date.parse(hour.windowStartUtc), hour]))
+    const viewUpdates: Array<{ name: string; etag: string; before: UsageOverviewRow; value: UsageShardView }> = []
+    for (let shard = 0; shard < this.shardCount; shard += 1) {
+      const viewName = `views/dashboard-24h/shards/${shard}.json`
+      const existing = await this.read(this.usage, viewName)
+      if (!existing) continue
+      const view = UsageShardViewSchema.parse(existing.data)
+      const before = view.tenants.find((row) => row.tenantId === tenantId)
+      if (!before) continue
+      const project = (hour: HourlyUsage) => {
+        const replacement = byStart.get(Date.parse(hour.windowStartUtc))
+        return replacement ? overviewHour(replacement) : hour
+      }
+      const next = { ...before, hours: before.hours.map(project), latest: before.latest ? project(before.latest) : null }
+      const value = { ...view, tenants: view.tenants.map((row) => row.tenantId === tenantId ? next : row) }
+      if (JSON.stringify(value) !== JSON.stringify(view)) viewUpdates.push({ name: viewName, etag: existing.etag, before, value })
+    }
+    const previousIds = new Set(originals.map((hour) => hour.comparisonBackfillAuditId))
+    const reusableId = !changed && previousIds.size === 1 ? [...previousIds][0] : undefined
+    if (!changed && viewUpdates.length === 0) return { changed: false, hours: originals, auditId: reusableId ?? null, cacheUpdated: 0 }
+    const operationId = reusableId ?? auditId
+    const prefix = `usage-context-backfill/${operationId}`
+    const prepared = await this.read(this.operations, `${prefix}/before.json`)
+    if (!prepared) {
+      const originalBytes = await this.usage.getBlockBlobClient(name).downloadToBuffer(0, undefined, {
+        conditions: { ifMatch: stored.etag }, abortSignal: signal,
+      })
+      await this.operations.getBlockBlobClient(`${prefix}/original-day.json`).upload(originalBytes, originalBytes.length, {
+        conditions: { ifNoneMatch: '*' }, abortSignal: signal,
+        blobHTTPHeaders: { blobContentType: 'application/json; charset=utf-8' },
+      })
+      await this.write(this.operations, `${prefix}/before.json`, {
+        action: 'usage.context-estimates.prepared', actor, tenantId, occurredAtUtc: new Date().toISOString(),
+        sourceBlob: name, sourceEtag: stored.etag, sourceSha256: createHash('sha256').update(originalBytes).digest('hex'),
+        windows: originals.map((hour) => hour.windowStartUtc), original: stored.data, proposed,
+        views: viewUpdates.map((view) => ({ name: view.name, etag: view.etag, tenantRow: view.before })),
+      }, null, signal)
+    } else {
+      const previous = z.object({ tenantId: TenantIdSchema, sourceBlob: z.string(), windows: z.array(z.string()) }).parse(prepared.data)
+      if (previous.tenantId !== tenantId || previous.sourceBlob !== name ||
+        JSON.stringify([...previous.windows].sort()) !== JSON.stringify(originals.map((hour) => hour.windowStartUtc).sort())) {
+        throw new Error('The existing context backfill audit does not match this exact target.')
+      }
+    }
+    if (changed) await this.write(this.usage, name, TenantDailyUsageSchema.parse({
+      ...day, hours: day.hours.map((hour) => byStart.get(Date.parse(hour.windowStartUtc)) ?? hour),
+    }), stored.etag, signal)
+    for (const view of viewUpdates) await this.write(this.usage, view.name, view.value, view.etag, signal)
+    const completed = await this.read(this.operations, `${prefix}/after.json`)
+    if (!completed) await this.write(this.operations, `${prefix}/after.json`, {
+      action: 'usage.context-estimates.completed', actor, tenantId, occurredAtUtc: new Date().toISOString(),
+      sourceBlob: name, hours: proposed, cacheUpdated: viewUpdates.length,
+      notificationsReplayed: false,
+    }, null, signal)
+    return { changed, hours: proposed, auditId: operationId, cacheUpdated: viewUpdates.length }
   }
 
   async saveHours(values: HourlyUsage[], signal: AbortSignal) {

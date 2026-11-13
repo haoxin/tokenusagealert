@@ -1,9 +1,13 @@
-# Azure OpenAI 用量费用告警平台 RPI 实施计划
+---
+title: Azure OpenAI 用量费用告警平台 RPI 实施计划
+description: 当前实现基线、交付历史、验证边界与后续实施计划
+---
 
 > 2026-10-06 按代码/部署模板校准，2026-11-06 更新缓存/priority 上线记录。第 1–6 批及第 7–18 节补充为交付历史，
 > 后续用户批准的需求已经覆盖部分最初范围；当前能力以第 6.1 节为准。
 > 第七批生产加固/Marketplace 等仍为计划，不从一个健康测试 revision 推断已经完成。
 > 2026-10-07 邮件策略：费用恢复只记录，不投递；超限/持续提醒的标题和正文均包含 USD 估算金额。
+> 2026-11-11 源码更新：按用户明确选择新增缓存比例费用估算 version 4；不是精确响应计量，不代表已经发布新镜像。
 
 ## 1. 执行模式
 
@@ -231,7 +235,7 @@ infra/
 | 基础设施 | Consumption Web + 四类 Job、Blob JSON、ACR MI pull；private 默认，新增明确选择的 public/MI 新安装模板 | public 为模板级验证，未替合作伙伴真实部署；生产加固/完整恢复验收未完成，无 AKS/数据库/Key Vault 模块 | [main](../infra/bicep/main.bicep)、[安装指南](partner-installation.md) |
 | 登录 | Easy Auth + 显式开发身份；已获准用户同等业务权限 | app 创建、secret 保管和用户/组分配须管理员；无 Admin/Viewer 应用权限分层 | [身份解析](../apps/web/server/src/auth.ts)、[配置脚本](../infra/bicep/scripts/configure-entra-auth.ps1) |
 | 授权/租户 | Lighthouse、多客户多订阅、预登记可选、发现后显式启用、独立解除、归档/重新授权 | pending 无委派登记可硬删除；没有通用停用/任意软删除 API | [租户 API](../apps/web/server/src/app.ts)、[仓储](../packages/azure/src/index.ts) |
-| 指标/缓存 | Models 主总量、同小时实际响应档位核对、OpenAI 缓存命中率、Anthropic 专属缓存数量；资源发现仍 2 小时 | 2026-11-06 已上线并验证定义/空用量；新正用量未另测。OpenAI PAYG 无精确缓存计数，不用百分比抵扣 | [Source](../packages/azure/src/usage-source.ts)、[指标边界](technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06) |
+| 指标/缓存 | Models 主总量、实际响应档位核对、OpenAI 命中率；version 4 按比例估算缓存读取和费用，发现仍 2 小时 | 比例不是精确 token；GPT 写入无适用的精确 Monitor counter，未知写入仅替换非缓存输入构造上限；新源码不等于已发布 | [Source](../packages/azure/src/usage-source.ts)、[估算策略](technical-design.md#35-cached-input-和第一阶段估算策略) |
 | 价格/计价 | 官方仅 Azure OpenAI/USD，parser 3、compact v2、手动文本 token 缺价；通用无模型白名单、区间估算 | 非 OpenAI 官方价格未自动接入；图片数/秒数/容量/训练等缺计量不盲算 | [price filter](../packages/azure/src/pricing-source.ts)、[schemas](../packages/schemas/src/price-book.ts)、[计价](../packages/domain/src/usage.ts) |
 | 历史/补算 | 查询 1–240 小时、原阈值保留；受控单小时只补原缺失真实暂定金额，原 snapshot/before-after 审计 | 不自动重算已知金额、不因新价批量改历史；无 maintenance/migration 通用 CLI | [汇总/补算](../packages/domain/src/usage-summary.ts)、[Job](../apps/jobs/usage-collector/src/index.ts) |
 | 邮件 | 下限超限、6 小时提醒；费用恢复仅更新状态/事件，不发邮件；标题/正文含估算金额；Outbox、sender 验证及历史补算标注 | accepted 非 Delivered；unknown 不自动重发；旧待发恢复项也抑制，数据质量通知不变 | [事件](../packages/azure/src/alert-producer.ts)、[投递](../packages/azure/src/mail-dispatch.ts) |
@@ -584,3 +588,67 @@ digest。实例中的正式运行限制不代表第七批生产加固已自动�
   非零 Priority 或精确缓存折扣。Mail 正常执行 succeeded、0 失败/unknown。
 - 私网读回确认价格 ETag、tenant/mail/manual 配置和保留历史小时未改；API 匿名请求 401，
   内部 readiness 200。未调用模型、未发送测试邮件、未增加其他 provider 价格。
+
+## 19. Cached 比例费用估算收尾（2026-11-12，本地）
+
+- 保留 version 4 的比例估算口径：按输入量和小时命中率拆分 cached/uncached，
+  再匹配实际 Standard/Priority 档位的普通输入、缓存读取和写入单价；不重复收取输入费用。
+- 修复极小有效命中率被转成科学计数法后无法保存的问题。原始百分比与比例估算量独立
+  保存，不把估算读取量冒充 Monitor 精确计数，也不把缺少缓存单价当成零费用。
+- 公共费用提示与小时明细统一说明比例估算和历史策略；浏览器 fixture 不再依赖 API
+  登录服务，截图由测试运行器管理，不写入固定的旧会话目录。
+- 本地 242 项领域/采集/schema 测试、28 项 Blob/历史补算/邮件回归、6 项正式构建浏览器
+  测试及工作区 typecheck/build 通过。Blob 读回保留 `cacheReadEstimate`、实际档位分组及
+  未知的精确缓存计数；历史补算告警同时覆盖 version 3/4。
+  未重算旧小时、未调用模型、未发送真实邮件，也未发布新镜像；部署状态仍以第 18 节
+  的已记录证据为准，不把本地完成当作新版本已上线或实际账单核验。
+
+## 20. 缓存比例估算发布与真实测试阻塞（2026-11-12）
+
+- `ms-ext` 现有 Web/Usage/Mail 已更新为同一不可变镜像
+  `sha256:cdd3261f7708aa876efb11f08d5eafb8de14a7fcde82ef6ff547a178191f7eb5`，
+  ACR 构建 `dts` 使用 99 个正式源码/清单文件；未上传测试、文档、附件或本地配置。
+- Web revision `aoai-cost-test-web--0000022` Healthy、100% 流量；先确认其 version 4
+  reader 和私网 readiness 200，再更新 Mail、Usage。Pricing/Authorization 镜像未改。
+- 正式 Azure 校验流程、8 项基础设施契约及冻结锁文件生产镜像构建通过。完整模板预览的
+  无关漂移未应用；全部组件非 image 配置及认证指纹保持一致，身份、网络、资源、计划、
+  阈值和收件人未改，匿名业务 API 仍为 401。
+- 已在新容器内用实际部署模块和活动价格运行非计费内存检查，覆盖 Standard/Priority
+  缓存读取价格、写入区间及极小缓存估算量；未写入模拟小时。24 个已有 version 3 小时
+  保持可读，当前 USD 3/hour 阈值、邮件配置和价格快照/ETag 均未变化。新镜像正常 Mail
+  执行已成功，不等于测试邮件送达证明。
+- 当时错误地把真实测试目标识别成 `fte`，该订阅确为 Disabled，且未在其上发出推理
+  请求。用户随后纠正：应在 `mct` 测试。这个目标选择错误已修正；不能继续把 fte 状态
+  当成 MCT 测试的阻塞，也不需要恢复 fte。后续真实测试见第 21 节。
+
+## 21. MCT 真实预算测试与费用核对（2026-11-12，已完成）
+
+- 正确订阅为 `mct`（`6ce33da7-9e41-4e48-8a95-c48f1bde120a`），实际 ARM 状态
+  Enabled；平台的真实授权清单也仅期望该 MCT 订阅，不能从共享 tenant ID 推断成 fte。
+- 使用既有 `aoai-mct-chx` / `aoai-mct-validation-rg` /
+  `gpt-5.6-sol-validation`，模型 gpt-5.6-sol 2026-07-09、GlobalStandard、
+  swedencentral，额度 50,000 TPM / 50 RPM，原生能力支持 Priority。不重新部署平台、
+  创建模型、调容量或修改权限；现有账号凭据仅保留在请求进程内存中。
+- 原 USD 3.50 总预算和同一请求账本保留，没有重置已消费/预留金额；所有真实请求先
+  原子落盘最坏情况预留，再发送合成内容，输出量明确受限，模糊结果不盲目重试。
+- 首个真实 Standard 缓存预热返回输入 2,214、输出 64、缓存写入 2,137、读取 0，
+  按活动零售价估算 USD 0.012273。随后相同前缀的 Standard 请求返回缓存读取 2,137、
+  写入 0、输出 1,024，估算 USD 0.0216428，已取得真实缓存命中证据。
+- 真实批次已完成：共 29 次 HTTP 200、全部费用已确认，其中实际 Standard 2 次、
+  Priority 27 次；输入 11,972、输出 86,449、缓存读取 8,548、写入 2,137 token。
+  按响应 usage 和活动零售价估算 USD 3.4625486；独立审计每次预留，最大暴露
+  USD 3.4999966，未超过同一 USD 3.50 上限，无未决预留或模糊结果。
+- 请求实际跨越 UTC 08:00–09:00 和 09:00–10:00 两个自然小时；最后一小时需等
+  UTC 10:00 结束并由 10:15 正常计划采集。UTC 10:17 已读回两个 complete/version 4
+  记录；原生 Monitor、保存的输入/输出和实际档位数量均与完整 API 批次一致，未补写
+  模拟用量或历史金额。小时边界与客户端分组有 37 输入/802 输出的归属差异，合计不丢失。
+- 页面两小时估算分别为 USD 2.893757160120–4.401150964751 和
+  USD 0.606792000000–0.913260000000，合计 USD 3.500549160120–5.314410964751。
+  其下限比响应 usage 零售价 USD 3.4625486 高 USD 0.038000560120（1.097474%）；
+  实际保存值与已声明的 version 4 算法重新核算一致。
+- API 精确缓存读取为 8,548，而按 Monitor 小时平均比例推算为 2,354.733609。
+  平均百分比不是精确 token 加权计数，各档位同比分配也是假设，所以缓存费用仍是
+  近似估算，显示区间不保证包住实际账单；精确计费仍需响应级 usage，不能宣称完全准确。
+- 既有阈值为 USD 3/小时；两个小时的估算下限各自未超限，因此未产生 cost-exceeded/
+  cost-reminder 或对应超限邮件，符合原策略。批次合计超过 USD 3 不等于单小时超限。
+  未额外发送测试邮件；最终合同价、税费或实际账单未在本次验证中核实。

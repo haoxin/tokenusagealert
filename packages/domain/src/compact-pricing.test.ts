@@ -203,7 +203,7 @@ describe('manual missing-price fallback', () => {
       [manual({ modelName: 'gpt-6-luna' })],
       [{ ...input, meterId: guid(50), skuName: '6-luna ShortCo Inp Std Gl', productName: 'Azure OpenAI GPT6' }],
     ), hour)
-    expect(result).toMatchObject({ costUsd: '2.000000000000', costUpperUsd: null, pricingStatus: 'missing' })
+    expect(result).toMatchObject({ costUsd: '1.000000000000', costUpperUsd: null, pricingStatus: 'missing' })
     expect(result.prices.every((price) => price.source === 'official')).toBe(true)
     expect(result.issues[0]?.code).toBe('PRICE_MATCH_FAILED')
   })

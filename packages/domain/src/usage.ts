@@ -1,4 +1,4 @@
-import { Decimal } from 'decimal.js'
+import { Decimal as DecimalBase } from 'decimal.js'
 import type {
   DeploymentInventory, DeploymentUsage, NormalizedPrice, PricingSnapshot,
   TokenObservation, UsagePriceReference, UsagePriceBook, TokenBillingSlice, CompactPriceRate,
@@ -8,6 +8,8 @@ import { normalizedPriceLabel, priceVersionMatches, tokenPriceTerms } from './pr
 
 export const HOUR_MS = 3_600_000
 export const USAGE_RETENTION_MS = 240 * HOUR_MS
+export const USAGE_PRICING_RULE_VERSION = 5
+const Decimal = DecimalBase.clone({ precision: 40, rounding: DecimalBase.ROUND_HALF_EVEN })
 
 export function hasAdditionalCacheTokens(observation: Pick<TokenObservation, 'billingTelemetry'>) {
   const cache = observation.billingTelemetry?.cache
@@ -100,6 +102,7 @@ export function calculateDeploymentCost(
   const result: DeploymentUsage = {
     ...observation, issues: [...observation.issues], costUsd: null, costUpperUsd: null,
     pricingStatus: 'missing', prices: [], pricingUncertainty: [],
+    contextMixEstimate: { method: 'equal-short-long', basis: 'tokens', shortWeight: '0.5', longWeight: '0.5' },
   }
   const deployment = observation.deployment
   const issue = (code: string, message: string) =>
@@ -203,11 +206,34 @@ export function calculateDeploymentCost(
       return result
     }
   }
+  let ratio = new Decimal(0)
+  if (deployment.modelFormat?.toLowerCase() === 'openai' && cache?.source === 'openai-cache-match-rate' &&
+    cache.status === 'available' && cache.matchRatePercent !== null) {
+    if (!/^\d+(?:\.\d+)?$/.test(cache.matchRatePercent) || new Decimal(cache.matchRatePercent).gt(100)) {
+      issue('CACHE_MATCH_RATE_INVALID', '缓存命中率不在 0–100% 范围内，不能按比例估算。')
+      return result
+    }
+    ratio = new Decimal(cache.matchRatePercent).div(100)
+    const read = new Decimal(observation.inputTokens).times(ratio)
+    result.cacheReadEstimate = {
+      method: 'hourly-match-rate', matchRatePercent: cache.matchRatePercent,
+      estimatedReadTokens: read.toFixed(), estimatedNonCachedInputTokens: new Decimal(observation.inputTokens).minus(read).toFixed(),
+      tierAllocation: 'same-ratio-per-tier',
+    }
+  }
+  const contextSlices = slices.flatMap((slice) => (['short', 'long'] as const).map((context) => ({
+    ...slice, context, tokens: new Decimal(slice.tokens).div(2).toFixed(),
+  })))
+  const pricingSlices = contextSlices.flatMap((slice) => slice.direction === 'input' && ratio.gt(0) ? [
+    { ...slice, tokens: new Decimal(slice.tokens).times(new Decimal(1).minus(ratio)).toFixed() },
+    { ...slice, direction: 'cachedInput' as const, tokens: new Decimal(slice.tokens).times(ratio).toFixed() },
+  ] : [slice])
   let lower = new Decimal(0)
   let upper = new Decimal(0)
   let matched = 0
   let incomplete = unsupportedUnits.length > 0 || cacheBillingUnverified
   const uncertainty = new Set<NonNullable<DeploymentUsage['pricingUncertainty']>[number]>()
+  if (ratio.gt(0) && new Decimal(observation.inputTokens).gt(0)) uncertainty.add('cacheRead')
   const references = new Map<string, UsagePriceReference>()
   const addReference = (rate: UsageRate, direction: UsagePriceReference['direction'], bound: 'lower' | 'upper' | 'both') => {
     const key = `${direction}|${rate.meterId}|${rate.effectiveFromUtc}`
@@ -224,19 +250,33 @@ export function calculateDeploymentCost(
     const sorted = [...rates].sort((a, b) => ratePerToken(a).comparedTo(ratePerToken(b)) || a.meterId.localeCompare(b.meterId))
     return [sorted[0]!, sorted[sorted.length - 1]!] as const
   }
-  for (const slice of slices) {
-    const candidates = possibleTiers(slice.tier).flatMap((tier) => candidatesFor(slice.direction, tier)).filter((rate) =>
+  const ratesFor = (slice: TokenBillingSlice, direction: UsagePriceReference['direction']) =>
+    possibleTiers(slice.tier).flatMap((tier) => candidatesFor(direction, tier)).filter((rate) =>
       (slice.context === null || rate.context === 'uniform' || rate.context === slice.context) &&
       (slice.modality === null || rate.modality === 'unspecified' || rate.modality === slice.modality))
+  const inputs: { context: 'short' | 'long'; tokens: DecimalBase; minimum: DecimalBase; maximum: DecimalBase; writes: UsageRate[] }[] = []
+  for (const slice of pricingSlices) {
+    const identity = { ...slice, direction: slice.direction === 'cachedInput' ? 'input' as const : slice.direction }
+    const candidates = ratesFor(identity, slice.direction)
     if (!candidates.length) {
       if (new Decimal(slice.tokens).gt(0)) {
         incomplete = true
-        issue('PRICE_MATCH_FAILED', `${slice.direction} 计费分组缺少对应单价；已知方向保留为小计，缺失方向不补零。`)
+        issue(slice.direction === 'cachedInput' ? 'CACHE_READ_PRICE_MISSING' : 'PRICE_MATCH_FAILED',
+          `${slice.direction} 计费分组缺少对应单价；已知方向保留为小计，缺失方向不补零。`)
       }
       continue
     }
     matched += 1
     const [minimum, maximum] = extrema(candidates)
+    if (candidates.some((rate) => rate.context !== 'uniform')) uncertainty.add('context')
+    if (slice.direction === 'input') {
+      const writes = ratesFor(identity, 'cacheWrite')
+      if (writes.some((rate) => rate.context !== 'uniform')) uncertainty.add('context')
+      inputs.push({
+        context: slice.context, tokens: new Decimal(slice.tokens),
+        minimum: ratePerToken(minimum), maximum: ratePerToken(maximum), writes,
+      })
+    }
     lower = lower.plus(new Decimal(slice.tokens).times(ratePerToken(minimum)))
     upper = upper.plus(new Decimal(slice.tokens).times(ratePerToken(maximum)))
     const varies = !ratePerToken(minimum).eq(ratePerToken(maximum))
@@ -256,43 +296,48 @@ export function calculateDeploymentCost(
       }
     }
   }
-  const writes = [...tiers].flatMap((tier) => candidatesFor('cacheWrite', tier))
-  if (writes.length && new Decimal(observation.inputTokens).gt(0)) {
-    const [minimum, maximum] = extrema(writes)
-    const count = observation.cacheWriteTokens
-    if (count !== undefined && count !== null && new Decimal(count).gt(observation.inputTokens)) {
-      issue('CACHE_WRITE_COUNT_INVALID', '缓存写入 token 数超出输入总数，不能确认计价。')
+  const count = observation.cacheWriteTokens
+  const nonCached = new Decimal(observation.inputTokens).times(new Decimal(1).minus(ratio))
+  if (count !== undefined && count !== null && (!/^\d+$/.test(count) || new Decimal(count).gt(nonCached))) {
+    issue('CACHE_WRITE_COUNT_INVALID', '缓存写入数量无效或超出比例估算后的非缓存输入；不能重复分配缓存读写 token。')
+    return result
+  }
+  if (count !== undefined && count !== null && new Decimal(count).gt(0)) {
+    if (inputs.some((input) => input.tokens.gt(0) && input.writes.length === 0) ||
+      (['short', 'long'] as const).some((context) => inputs.filter((input) => input.context === context)
+        .reduce((sum, input) => sum.plus(input.tokens), new Decimal(0)).lt(new Decimal(count).div(2)))) {
+      issue('CACHE_WRITE_PRICE_MISSING', '缓存写入缺少适用分组单价，不能按普通输入或其他服务档位猜价。')
       return result
     }
-    if (count !== undefined && count !== null) {
-      const inputs = slices.filter((slice) => slice.direction === 'input').map((slice) => {
-        const rates = possibleTiers(slice.tier).flatMap((tier) => candidatesFor('input', tier)).filter((rate) =>
-          (slice.context === null || rate.context === 'uniform' || rate.context === slice.context) &&
-          (slice.modality === null || rate.modality === 'unspecified' || rate.modality === slice.modality))
-        const bounds = rates.length ? extrema(rates) : null
-        return { tokens: new Decimal(slice.tokens), minimum: bounds ? ratePerToken(bounds[0]) : new Decimal(0),
-          maximum: bounds ? ratePerToken(bounds[1]) : new Decimal(0) }
-      })
-      const replacedInput = (mode: 'minimum' | 'maximum') => {
-        let remaining = new Decimal(count)
-        let amount = new Decimal(0)
-        const sorted = [...inputs].sort((a, b) => mode === 'maximum'
-          ? b.maximum.comparedTo(a.maximum) : a.minimum.comparedTo(b.minimum))
-        for (const input of sorted) {
-          const replaced = Decimal.min(input.tokens, remaining)
-          amount = amount.plus(replaced.times(input[mode])); remaining = remaining.minus(replaced)
+    const adjustment = (bound: 'lower' | 'upper') => {
+      const groups = inputs.filter((input) => input.tokens.gt(0)).map((input) => {
+        const prices = extrema(input.writes)
+        const price = prices[bound === 'lower' ? 0 : 1]
+        return { ...input, price, delta: ratePerToken(price).minus(input[bound === 'lower' ? 'minimum' : 'maximum']) }
+      }).sort((a, b) => bound === 'lower' ? a.delta.comparedTo(b.delta) : b.delta.comparedTo(a.delta))
+      let amount = new Decimal(0)
+      for (const context of ['short', 'long'] as const) {
+        let remaining = new Decimal(count).div(2)
+        for (const group of groups.filter((input) => input.context === context)) {
+          const tokens = Decimal.min(group.tokens, remaining)
+          if (tokens.gt(0)) addReference(group.price, 'cacheWrite', bound)
+          amount = amount.plus(tokens.times(group.delta)); remaining = remaining.minus(tokens)
         }
-        return amount
       }
-      lower = lower.minus(replacedInput('maximum')).plus(new Decimal(count).times(ratePerToken(minimum)))
-      upper = upper.minus(replacedInput('minimum')).plus(new Decimal(count).times(ratePerToken(maximum)))
-      lower = Decimal.max(0, lower)
-      if (new Decimal(count).gt(0)) {
-        addReference(minimum, 'cacheWrite', 'lower'); addReference(maximum, 'cacheWrite', 'upper')
+      return amount
+    }
+    lower = lower.plus(adjustment('lower')); upper = upper.plus(adjustment('upper'))
+  } else if (count === undefined || count === null) {
+    for (const input of inputs.filter((input) => input.tokens.gt(0) && input.writes.length > 0)) {
+      const [minimum, maximum] = extrema(input.writes)
+      const lowerDelta = Decimal.min(0, ratePerToken(minimum).minus(input.minimum))
+      const upperDelta = Decimal.max(0, ratePerToken(maximum).minus(input.maximum))
+      lower = lower.plus(input.tokens.times(lowerDelta)); upper = upper.plus(input.tokens.times(upperDelta))
+      if (!lowerDelta.isZero() || !upperDelta.isZero()) {
+        uncertainty.add('cacheWrite')
+        if (lowerDelta.lt(0)) addReference(minimum, 'cacheWrite', 'lower')
+        if (upperDelta.gt(0)) addReference(maximum, 'cacheWrite', 'upper')
       }
-    } else {
-      upper = upper.plus(new Decimal(observation.inputTokens).times(ratePerToken(maximum)))
-      uncertainty.add('cacheWrite'); addReference(maximum, 'cacheWrite', 'upper')
     }
   }
   if (matched === 0) return result

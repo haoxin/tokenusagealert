@@ -1,10 +1,14 @@
-# Azure OpenAI 费用告警平台：管理员与客户操作手册
+---
+title: Azure OpenAI 费用告警平台：管理员与客户操作手册
+description: 平台安装后日常采集、价格估算、通知和授权操作说明
+---
 
 适用于当前仓库和 `ms-ext` 测试实例；2026-11-06 缓存/priority 补充能力已上线，
 Web revision `0000021` Healthy、100% 流量，真实 Collector 已完成指标定义/空用量采集验证。
 这不表示已经做过新一轮非零 Priority/缓存调用测试。第 1–6 批及后续通用
 计价、手动缺价和 Models 指标迁移已纳入本文；生产加固仍未全部完成。
 本文说明操作步骤，不会自动执行授权或部署。
+2026-11-11 源码新增 version 4 缓存比例估算；部署该版本后新计算小时生效，旧小时不自动改写。
 新合作伙伴的独立安装使用 [合作伙伴安装与移交指南](partner-installation.md)；
 本文下面的实例 ID、邮箱和私网配置是原测试实例记录，不是通用默认参数。
 
@@ -387,6 +391,7 @@ az deployment sub create --subscription "$SUB" \
 | 指标口径 | Models - Usage：`InputTokens` / `OutputTokens`；按部署、模型、版本拆分 |
 | 实际服务档位 | 支持时补充 `ServiceTierResponse` 分组，核对 Models 总量后计价；priority 请求降级按实际响应档位 |
 | 缓存观测 | OpenAI 为小时平均命中率，不是 cached token 数；Anthropic 的专属读写/TTL 计数单独保留 |
+| 双费用估算 | version 5：浅蓝虚线为固定 50% 短/50% 长上下文参考；深蓝实线为 `FoundryModelEstimatedCost` |
 | 资源发现 | 每 2 小时刷新清单；新增资源可能需等待，旧小时不默认补采 |
 | 结果确认 | 新小时为“暂定” `provisional`；不随时间自动变成“已确认” `final` |
 | 价格同步 | 北京时间每日 00:00，校验后自动更新，无人工复核 |
@@ -403,14 +408,40 @@ az deployment sub create --subscription "$SUB" \
 - Models token 指标没有实际服务档位时可能出现更宽估算区间；不能无证据认为所有调用
   都用 Standard。新采集器优先核对 OpenAI 补充指标的实际响应档位；补充失败/不一致
   会显示问题，不把两组 token 相加，也不以请求的 priority 档位猜价。
-  单独的 Estimated Cost Preview 不用作正式费用主源。
-- 金额是 USD 公开零售价估算，不是实际账单；缓存输入按普通输入价保守估算。
-- **缓存精度限制**：`AzureOpenAIContextTokensCacheMatchRate` 是 Percent/Average，
-  不是精确缓存量；即便显示 80%，也不能用小时输入 token × 80% 抵扣费用。OpenAI
-  精确缓存量需要响应级 `cached_tokens/cache_write_tokens`，当前没有该数据源。
+  `FoundryModelEstimatedCost` Preview 作为独立原生费用估算显示，不替代本地参考告警来源，也不是正式账单。
+- 金额是 USD 公开零售价估算，不是实际账单。
+- 缓存比例估算：version 4 按输入 token × `AzureOpenAIContextTokensCacheMatchRate` / 100
+  推算读取量，剩余为非缓存输入；各实际档位沿用部署比例并匹配各自单价。详情中的
+  “比例估算”数量不是 Monitor 精确 token，可含小数。缺少比例不当作零缓存。
+  命中率按普通十进制字符串保存；极小的有效比例不会转成科学计数法或舍入成零，
+  原始百分比、比例估算数量和未知的精确缓存计数分别保留。
+  OpenAI 精确数量需要响应级 `cached_tokens/cache_write_tokens`，当前没有该接入源。
+  正比例缺少 cached-input 单价会显示 `CACHE_READ_PRICE_MISSING`，不会套其他档位价格。
+  GPT 当前没有适用的精确写入 Monitor 指标；未知写入在非缓存输入中按 write 单价
+  替换普通 input 形成上限，不重复收费。不能使用 Anthropic 的 5m/1h 写入计数替代。
   租户详情“缓存与实际服务档位”会区分百分比、Anthropic 专属计数、无观测和读取失败。
   `CACHE_BILLING_UNVERIFIED` 表示缓存计费协议/TTL 仍未确认，不能把小计当作完整费用。
   官方指标和边界见 [技术设计 3.5.1](technical-design.md#351-官网核实的缓存priority-指标与当前边界2026-11-06)。
+  2026-11-12 的 MCT version 4 真实验证中，响应 usage 零售价合计 USD 3.4625486，页面估算下限
+  为 USD 3.500549160120，高约 1.10%；token 和实际档位总量一致，但平均比例推算的
+  缓存数量并不精确，区间也不是真实账单上下界。批次跨两个自然小时，各小时未超
+  USD 3 阈值，因此没有超限邮件；不能把跨小时合计当成单小时费用。详见
+  [实测记录](rpi-implementation-plan.md) 第 21 节。
+- version 5 本地参考采用 `equal-context-retail-range`：各实际档位的输入/输出 token
+  固定各半使用 ShortCo/LongCo 单价，保留奇数 token 的小数分配；原始上下文、档位及
+  缓存计数不改写。缓存读取仍按小时比例估算，已知写入也按两种上下文各半替换普通输入。
+  未知写入和其他缺失条件仍可在明细保留区间，但图表的两条线不再表示上下限。
+- 原生费用来自 Metrics API 的 `FoundryModelEstimatedCost` / `Total`，返回 Unit 为
+  `Unspecified`，描述中的金额是 USD。它使用独立的小数金额解析器，不放宽 token 整数
+  校验。无数据、读取失败、不支持或覆盖不完整时显示“—”，不填零、不用本地金额代替。
+  原生窗口小计只累加有完整指标的小时，并显示覆盖数量；Preview 不保证最终账单、
+  合同折扣或所有部署类型的完整计价。详见
+  [技术设计 3.5.2](technical-design.md#352-双费用估算与固定上下文参考)。
+- 受控上下文/原生估算补齐与“缺价补算”分开：只处理明确指定的保留期内已完成小时，
+  使用原价格快照，备份原始日 Blob 字节与 ETag，再条件写入派生费用和对应租户的
+  dashboard 缓存。审计保存在 `operations/usage-context-backfill/`，小时带
+  `comparisonBackfillAuditId`。不修改其他小时、原始用量、阈值、确认状态或水位，
+  不重新评估历史告警、不补发邮件；现有缺价 API 仍不能覆盖已有可信金额。
 - **默认精简价格下载**：`aoai-pricing.json` 是内部计算实际使用的官方精简目录，加上
   已登记的手动备用规则。统一 USD／100 万 token，包含模型、SKU、区域、上下文、
   服务档位、输入/输出/缓存方向、最新已生效日期和真实 meter ID；不提前用未来价。
@@ -434,7 +465,8 @@ az deployment sub create --subscription "$SUB" \
   备注建议记录官网或已确认报价依据。保存后从下一完整小时生效，采集要等待该
   窗口结束及正常 15 分钟缓冲。支持编辑、停用，均保留历史版本和审计，不改过去费用。
 - **官方优先**：官方有相同适用范围记录时，手动价只是备用，不覆盖官方报价。多个
-  官方上下文/模态价位无法从小时指标区分时显示区间，不再因模型不在名单中拒绝计价。真正缺价的
+  version 5 的上下文参考固定各半；模态/档位/写入等条件不足仍在明细显示区间，
+  不再因模型不在名单中拒绝计价。真正缺价的
   文本 token 模型才使用唯一有效手动规则，不区分 short/long，缓存按普通输入估算。
   所有金额仍为 USD 估算，不是实际账单。详情与相关告警会标注手动价格来源。
   不要把示例单价、其他模型别名或未经确认的价格录入真实环境；没有价格显示“—”。

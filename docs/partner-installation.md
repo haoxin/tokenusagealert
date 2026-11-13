@@ -1,4 +1,7 @@
-# 合作伙伴安装与移交指南
+---
+title: 合作伙伴安装与移交指南
+description: 在合作伙伴独立 Azure 与邮件环境安装用量费用告警平台
+---
 
 适用版本：2026-10-07 的正式产品代码。目标是让合作伙伴在**自己的 Entra 租户、Azure
 订阅和 Microsoft 365 邮件组织**安装一个独立实例，而不是接管原测试实例。
@@ -459,13 +462,17 @@ token 备用规则。官方价格优先，手动价不覆盖适用官方价。�
 - OpenAI priority 不是独立 token 指标，而是 `ServiceTierResponse`；新采集器用
   `ProcessedPromptTokens/GeneratedTokens` 的响应档位分组补充 Models，逐部署核对同小时
   输入/输出总量后才计价。不按请求档位猜价，不重复计数。
-- OpenAI 缓存命中率是 Percent/Average，并非精确 cached token 数；当前不以该百分比抵扣
-  费用，缓存读取仍用普通输入价保守估算。响应级精确缓存量不在本平台的 Monitor 采集源中。
+- OpenAI 缓存命中率是 Percent/Average，并非精确 cached token 数。2026-11-11 的 version 4
+  源码按用户选择，用输入 × 比例推算缓存读取并按各实际档位缓存单价计费；各档位采用
+  同一部署比例是估算假设。比例不可用时不推断零缓存，保留普通输入估算。
+  GPT 写入没有适用的精确 Monitor counter；未知写入仅替换非缓存输入费用构造上限，
+  不再将完整写入价格叠加一遍。精确读写仍需响应级 `cached_tokens/cache_write_tokens`。
 - Anthropic 的 `cacheReadInputTokens/ephemeral5mInputTokens/ephemeral1hInputTokens`
   只保存适用 provider 的独立数量。没有验证相应单价/TTL 费用前仍为部分估算，不新增官方价格。
 - 补充能力由运行时 metricDefinitions 确认。标准 Lighthouse Reader 包含所需的管理面读取；
   403 不能通过扩大角色或添加存储密钥来绕过。
-- 新小时明细有可选 `billingTelemetry`。**先部署兼容 Web/API reader，再升级 Usage
+- 新小时明细有可选 `billingTelemetry`，version 4 还包含 `cacheReadEstimate` 和缓存读取
+  价格引用。**先部署兼容 Web/API reader，再升级 Usage
   Collector**；旧版严格 schema reader 不能保证读取新字段。既有历史不自动改写。
   当前 `ms-ext` 实例已于 2026-11-06 按 reader-first 顺序上线至 revision `0000021`，
   并通过实际 Collector 的指标定义/空用量验证；没有制造付费流量。合作伙伴自己的环境

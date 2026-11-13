@@ -17,43 +17,44 @@ export function UsageChart({ hours, threshold, select }: {
   const series: LineChartPoints[] = []
   let segment: LineChartPoints['data'] = []
   let previous: HourlyUsage | null = null
-  const upperSeries: LineChartPoints[] = []
-  let upperSegment: LineChartPoints['data'] = []
+  const nativeSeries: LineChartPoints[] = []
+  let nativeSegment: LineChartPoints['data'] = []
   const flush = () => {
-    if (segment.length) series.push({ legend: `已知估算 ${series.length + 1}`, color: '#0f6cbd', data: segment, lineOptions: { strokeWidth: 2, mode: 'lines+markers' } })
+    if (segment.length) series.push({ legend: '本地参考估算', color: '#479ef5', data: segment,
+      lineOptions: { strokeWidth: 1.5, strokeDasharray: '3 3', mode: 'lines+markers' } })
     segment = []
   }
-  const flushUpper = () => {
-    if (upperSegment.length) upperSeries.push({
-      legend: `估算上限 ${upperSeries.length + 1}`, color: '#479ef5', data: upperSegment,
-      lineOptions: { strokeWidth: 1.5, strokeDasharray: '3 3', mode: 'lines+markers' },
+  const flushNative = () => {
+    if (nativeSegment.length) nativeSeries.push({
+      legend: 'Azure 原生估算', color: '#0f6cbd', data: nativeSegment,
+      lineOptions: { strokeWidth: 2, mode: 'lines+markers' },
     })
-    upperSegment = []
+    nativeSegment = []
   }
   for (const hour of hours) {
-    if (previous && Date.parse(hour.windowStartUtc) - Date.parse(previous.windowStartUtc) !== 3_600_000) { flush(); flushUpper() }
+    if (previous && Date.parse(hour.windowStartUtc) - Date.parse(previous.windowStartUtc) !== 3_600_000) { flush(); flushNative() }
     if (hour.knownCostUsd === null || hour.status === 'failed') flush()
     else {
       segment.push({
         x: new Date(hour.windowStartUtc), y: Number(hour.knownCostUsd),
         xAxisCalloutData: usageDate(hour.windowStartUtc),
-        yAxisCalloutData: `已知估算下限 ${usageMoney(hour.knownCostUsd)}`,
-        markerColor: hour.status === 'partial' ? '#bc6600' : '#0f6cbd',
+        yAxisCalloutData: `${hour.pricingRuleVersion >= 5 ? '50/50 参考估算' : '历史参考估算'} ${usageMoney(hour.knownCostUsd)}`,
+        markerColor: hour.status === 'partial' ? '#bc6600' : '#479ef5',
         onDataPointClick: () => select(hour),
       })
     }
-    if (hour.status === 'failed' || hour.knownCostUpperUsd === undefined || hour.knownCostUpperUsd === null ||
-      hour.knownCostUsd === null || Number(hour.knownCostUpperUsd) <= Number(hour.knownCostUsd)) flushUpper()
-    else upperSegment.push({
-      x: new Date(hour.windowStartUtc), y: Number(hour.knownCostUpperUsd),
-      xAxisCalloutData: usageDate(hour.windowStartUtc), yAxisCalloutData: `已知估算上限 ${usageMoney(hour.knownCostUpperUsd)}`,
+    const native = hour.foundryEstimatedCost?.costUsd
+    if (native === undefined || native === null) flushNative()
+    else nativeSegment.push({
+      x: new Date(hour.windowStartUtc), y: Number(native),
+      xAxisCalloutData: usageDate(hour.windowStartUtc), yAxisCalloutData: `Azure 原生估算 ${usageMoney(native)}`,
       onDataPointClick: () => select(hour),
     })
     previous = hour
   }
   flush()
-  flushUpper()
-  series.push(...upperSeries)
+  flushNative()
+  series.push(...nativeSeries)
   const first = hours[0]
   const last = hours[hours.length - 1]
   if (threshold !== null && first && last) series.push({
@@ -63,12 +64,13 @@ export function UsageChart({ hours, threshold, select }: {
   })
   return <div ref={host} className="usage-chart">
     {hours.length === 0 ? <div className="empty-state"><strong>暂无小时趋势记录</strong><span>不会填充模拟曲线或将缺失数据补为零。</span></div> :
-      <LineChart data={{ lineChartData: series }} width={width} height={280} hideLegend hideTooltip={false}
-        yMinValue={0} yMaxValue={Math.max(1, ...hours.map((hour) => Number(hour.knownCostUpperUsd ?? hour.knownCostUsd ?? 0)), Number(threshold ?? 0)) * 1.2}
+      <LineChart data={{ lineChartData: series }} width={width} height={280} hideTooltip={false}
+        yMinValue={0} yMaxValue={Math.max(1, ...hours.flatMap((hour) =>
+          [Number(hour.knownCostUsd ?? 0), Number(hour.foundryEstimatedCost?.costUsd ?? 0)]), Number(threshold ?? 0)) * 1.2}
         xAxisTickCount={width < 500 ? 3 : 6} yAxisTickCount={4}
         tickFormat={(value) => usageDate(new Date(value).toISOString()).slice(5, 16)}
         yAxisTickFormat={(value: number) => `$${value.toFixed(2)}`}
         margins={{ left: 52, right: 15, top: 16, bottom: 40 }}
-        svgProps={{ 'aria-label': '小时费用趋势，红虚线为阈值，缺失记录不补零不跨缺口连线。' }} />}
+        svgProps={{ 'aria-label': '小时费用趋势，浅蓝虚线为50/50参考估算，深蓝实线为Azure原生估算，红虚线为阈值；缺失记录不补零。' }} />}
   </div>
 }

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { Decimal } from 'decimal.js'
 import {
   calculateDeploymentCost, collectionWindow, indexUsagePrices, mapConcurrent, tenantShard, summarizeUsageCosts,
+  USAGE_PRICING_RULE_VERSION, overviewHour,
 } from '@tokenusagealert/domain'
 import {
   HourlyUsageSchema, UsageExecutionSettingsSchema,
@@ -17,14 +18,11 @@ import type { UsageAlertSink } from './alert-producer.js'
 export * from './usage-store.js'
 export * from './usage-source.js'
 export { StorageLeaseBusyError } from './blob-lease.js'
+export { overviewHour } from '@tokenusagealert/domain'
 
 function sum(values: (string | null)[], precision = 12): string | null {
   const known = values.filter((value): value is string => value !== null)
   return known.length ? known.reduce((total, value) => total.plus(value), new Decimal(0)).toFixed(precision) : null
-}
-
-export function overviewHour(hour: HourlyUsage): HourlyUsage {
-  return { ...hour, breakdown: [], issues: hour.issues.slice(0, 3) }
 }
 
 type TenantStore = Pick<BlobTenantRepository, 'listTenants' | 'getTenant' | 'getSubscriptionInventory' | 'withTenantAuthorizationLease'>
@@ -172,6 +170,11 @@ export class UsageCollectionService {
             if (errors.length) run.issues.push({
               code: 'TENANT_USAGE_INCOMPLETE', message: `${tenant.displayName}：${errors.join(', ')}`, resourceId: tenant.tenantId,
             })
+            if (hour.breakdown.some((item) => item.foundryEstimatedCost?.status === 'failed')) run.issues.push({
+              code: 'TENANT_FOUNDRY_ESTIMATED_COST_FAILED',
+              message: `${tenant.displayName} 的 Azure 原生费用读取失败；参考计价和告警来源未切换，原生金额未填零。`,
+              resourceId: tenant.tenantId,
+            })
             return row
           } finally { activeTenants -= 1 }
         }, workSignal)
@@ -246,12 +249,13 @@ export class UsageCollectionService {
       finality: 'provisional', finalizedAtUtc: null,
       estimatedCostUsd: summary.estimatedCostUsd, knownCostUsd: summary.knownCostUsd,
       knownCostUpperUsd: summary.knownCostUpperUsd, thresholdUsd: tenant.hourlyThresholdUsd,
+      ...(summary.foundryEstimatedCost ? { foundryEstimatedCost: summary.foundryEstimatedCost } : {}),
       inputTokens: sum(observed.map((item) => item.inputTokens), 0) ?? (noDeployments ? '0' : null),
       outputTokens: sum(observed.map((item) => item.outputTokens), 0) ?? (noDeployments ? '0' : null),
       priceSnapshotId: snapshot?.official?.snapshotId ?? null,
       manualPriceSnapshotId: breakdown.some((item) => item.prices.some((price) => price.source === 'manual')) ? snapshot?.manual.snapshotId ?? null : null,
-      estimatePolicy: 'model-independent-retail-range',
-      pricingRuleVersion: 3, validation: 'awaiting-positive-usage-verification',
+      estimatePolicy: 'equal-context-retail-range',
+      pricingRuleVersion: USAGE_PRICING_RULE_VERSION, validation: 'awaiting-positive-usage-verification',
       coverage: {
         expectedSubscriptions, successfulSubscriptions: collected.successfulSubscriptions,
         accounts: collected.inventory.accounts.length, expectedDeployments: collected.inventory.deployments.length,

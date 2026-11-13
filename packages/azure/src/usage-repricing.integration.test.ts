@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { BlobServiceClient } from '@azure/storage-blob'
 import { describe, expect, it } from 'vitest'
-import { compactOfficialPrices, normalizePrices, businessDate } from '@tokenusagealert/domain'
-import { HourlyUsageSchema, PricingSnapshotSchema, type UsagePriceBook, type RetailPriceItem } from '@tokenusagealert/schemas'
+import { compactOfficialPrices, normalizePrices, businessDate, overviewHour } from '@tokenusagealert/domain'
+import { HourlyUsageSchema, PricingSnapshotSchema, type FoundryEstimatedCost, type HourlyUsage, type UsageShardView, type UsagePriceBook, type RetailPriceItem } from '@tokenusagealert/schemas'
 import { BlobUsageStore } from './usage-store.js'
 
 const client = BlobServiceClient.fromConnectionString('UseDevelopmentStorage=true')
@@ -60,7 +60,7 @@ describe('audited missing-amount repricing', () => {
       const saved = await f.store.withLease((signal) =>
         f.store.repriceMissingHour(f.hour.tenantId, f.hour.windowStartUtc, f.book, 'fixture', signal), AbortSignal.timeout(15_000))
       expect(saved).toMatchObject({ changed: true, before: f.hour, hour: {
-        knownCostUsd: '16.000000000000', knownCostUpperUsd: '16.000000000000', pricingRuleVersion: 3,
+        knownCostUsd: '16.000000000000', knownCostUpperUsd: '16.000000000000', pricingRuleVersion: 5,
         thresholdUsd: '1.00', inputTokens: f.hour.inputTokens, outputTokens: f.hour.outputTokens,
       } })
       expect(saved.hour.pricingRepairAuditId).toBe(saved.auditId)
@@ -92,6 +92,93 @@ describe('audited missing-amount repricing', () => {
       expect((await f.store.hours(f.hour.tenantId, 24))[0]?.knownCostUsd).toBe('0.50')
       const path = `tenants/${f.hour.tenantId}/${businessDate(f.hour.windowStartUtc).replaceAll('-', '/')}.json`
       expect((await client.getContainerClient(f.names.usage).getBlobClient(path).getProperties()).etag).toBeTruthy()
+    } finally { await f.cleanup() }
+  })
+})
+
+describe('bounded context/native estimate backfill', () => {
+  const confirmed = (hour: HourlyUsage) => HourlyUsageSchema.parse({
+    ...hour, status: 'complete', finality: 'final', finalizedAtUtc: hour.windowEndUtc, revision: 7,
+    knownCostUsd: '16.000000000000', knownCostUpperUsd: '16.000000000000', estimatedCostUsd: '16.000000000000',
+    pricingRuleVersion: 4, estimatePolicy: 'cache-ratio-retail-range', issues: [],
+    coverage: { ...hour.coverage, pricedDeployments: 1 },
+    breakdown: hour.breakdown.map((row) => ({ ...row, costUsd: '16.000000000000',
+      costUpperUsd: '16.000000000000', pricingStatus: 'matched', issues: [] })),
+  })
+  const estimate = (): FoundryEstimatedCost => ({
+    metricName: 'FoundryModelEstimatedCost', currency: 'USD', status: 'available',
+    costUsd: '12.000000000000', retrievedAtUtc: new Date().toISOString(), issue: null,
+  })
+
+  it('preserves original day bytes and facts, refreshes only the tenant cache, and recovers without rewriting the day', async () => {
+    const f = await fixture()
+    try {
+      const original = confirmed(f.hour)
+      const otherStart = new Date(Date.parse(original.windowStartUtc) - 3_600_000).toISOString()
+      const untouched = { ...original, windowStartUtc: otherStart, windowEndUtc: original.windowStartUtc }
+      const date = businessDate(original.windowStartUtc)
+      const name = `tenants/${original.tenantId}/${date.replaceAll('-', '/')}.json`
+      const blob = client.getContainerClient(f.names.usage).getBlockBlobClient(name)
+      const bytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, tenantId: original.tenantId,
+        businessDate: date, hours: [untouched, original] }, null, 2)}\n`)
+      await blob.upload(bytes, bytes.length, { conditions: { ifMatch: (await blob.getProperties()).etag } })
+      const otherTenant = { tenantId: guid(50), displayName: 'Unchanged tenant', status: 'active', thresholdUsd: '1.00',
+        latest: null, hours: [] }
+      const view: UsageShardView = {
+        schemaVersion: 1, runId: guid(51), shardId: 0, shardCount: 1, generatedAtUtc: original.collectedAtUtc,
+        windowStartUtc: original.windowStartUtc, windowEndUtc: original.windowEndUtc,
+        tenants: [{ tenantId: original.tenantId, displayName: 'Fixture', status: 'active', thresholdUsd: '1.00',
+          latest: overviewHour(original), hours: [overviewHour(untouched), overviewHour(original)] }, otherTenant],
+      }
+      await f.store.saveView(view, AbortSignal.timeout(10_000))
+      const requests = [{ windowStartUtc: original.windowStartUtc,
+        estimates: { [original.breakdown[0]!.deployment.id]: estimate() } }]
+      const run = () => f.store.withLease((signal) =>
+        f.store.backfillContextEstimates(original.tenantId, requests, f.book, 'fixture', signal), AbortSignal.timeout(20_000))
+      const result = await run()
+      const updated = result.hours[0]!
+      expect(updated).toMatchObject({ pricingRuleVersion: 5, estimatePolicy: 'equal-context-retail-range',
+        finality: 'final', finalizedAtUtc: original.finalizedAtUtc, revision: 8,
+        collectedAtUtc: original.collectedAtUtc, thresholdUsd: original.thresholdUsd,
+        inputTokens: original.inputTokens, outputTokens: original.outputTokens, priceSnapshotId: original.priceSnapshotId,
+        foundryEstimatedCost: { status: 'available', costUsd: '12.000000000000' } })
+      expect(updated.breakdown[0]!.deployment).toEqual(original.breakdown[0]!.deployment)
+      const operations = client.getContainerClient(f.names.operations)
+      expect(await operations.getBlobClient(`usage-context-backfill/${result.auditId}/original-day.json`).downloadToBuffer()).toEqual(bytes)
+      const storedDay = JSON.parse((await blob.downloadToBuffer()).toString())
+      expect(storedDay.hours[0]).toEqual(untouched)
+      const currentView = (await f.store.views())[0]!
+      expect(currentView.tenants[1]).toEqual(otherTenant)
+      expect(currentView.tenants[0]?.latest?.foundryEstimatedCost?.costUsd).toBe('12.000000000000')
+      expect(currentView.tenants[0]?.hours[1]?.breakdown).toEqual([])
+      const afterEtag = (await blob.getProperties()).etag
+      expect(await run()).toMatchObject({ changed: false, auditId: result.auditId, cacheUpdated: 0 })
+      await operations.getBlobClient(`usage-context-backfill/${result.auditId}/after.json`).delete()
+      await f.store.saveView(view, AbortSignal.timeout(10_000))
+      expect(await run()).toMatchObject({ changed: false, auditId: result.auditId, cacheUpdated: 1 })
+      expect((await blob.getProperties()).etag).toBe(afterEtag)
+      expect(await operations.getBlobClient(`usage-context-backfill/${result.auditId}/after.json`).exists()).toBe(true)
+    } finally { await f.cleanup() }
+  })
+
+  it('rejects unavailable native costs and the wrong original snapshot before creating backfill artifacts', async () => {
+    const f = await fixture()
+    try {
+      const original = confirmed(f.hour)
+      await f.store.saveHour(original, AbortSignal.timeout(10_000))
+      const requests = [{ windowStartUtc: original.windowStartUtc,
+        estimates: { [original.breakdown[0]!.deployment.id]: estimate() } }]
+      const unavailable = [{ ...requests[0]!, estimates: { [original.breakdown[0]!.deployment.id]:
+        { ...estimate(), status: 'noData' as const, costUsd: null } } }]
+      await expect(f.store.backfillContextEstimates(original.tenantId, unavailable, f.book, 'fixture', AbortSignal.timeout(10_000)))
+        .rejects.toThrow(/complete native estimates/)
+      const wrong = { ...f.book, official: { ...f.book.official!, snapshotId: guid(52) } }
+      await expect(f.store.backfillContextEstimates(original.tenantId, requests, wrong, 'fixture', AbortSignal.timeout(10_000)))
+        .rejects.toThrow(/original official/)
+      const artifacts = []
+      for await (const item of client.getContainerClient(f.names.operations).listBlobsFlat({ prefix: 'usage-context-backfill/' })) artifacts.push(item.name)
+      expect(artifacts).toEqual([])
+      expect((await f.store.hours(original.tenantId, 24)).find((hour) => hour.windowStartUtc === original.windowStartUtc)?.pricingRuleVersion).toBe(4)
     } finally { await f.cleanup() }
   })
 })

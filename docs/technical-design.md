@@ -1,4 +1,7 @@
-# Azure OpenAI 用量费用告警平台技术设计
+---
+title: Azure OpenAI 用量费用告警平台技术设计
+description: 合作伙伴多租户 Azure OpenAI 用量采集、零售价估算、告警与部署设计
+---
 
 > 校准基线：2026-10-06，按当前仓库代码、JSON schema 和 Bicep 模板核对。
 > “当前实现”指已存在的代码能力，不代表所有生产加固、容量目标和供应商计费族已完成验收。
@@ -6,6 +9,8 @@
 > 邮件策略更新（2026-10-07）：费用恢复仅保留状态/事件，不发恢复邮件；超限及持续提醒的标题和正文均包含估算金额。
 > 合作伙伴移交（2026-10-07）：新增明确选择的公网 HTTPS Blob/Consumption 安装 profile，原私网默认和当前实例不变；见 [安装指南](partner-installation.md)。
 > 指标补充（2026-11-06）：实际响应档位核对、OpenAI 缓存命中率及 Anthropic 专属缓存计数已上线当前实例，Web revision `0000021`。Collector 身份已实读指标定义及空用量窗口；没有据此声称已验证新正用量或 OpenAI PAYG 精确 cached-token 费用。
+> 缓存比例估算（2026-11-11 源码）：按用户选择，将小时平均命中率用于输入拆分和缓存单价估算。
+> 新计算规则为 version 4，不是精确缓存计量；旧小时不自动改写，本条不代表已部署新镜像。
 
 ### 当前实现与源码索引
 
@@ -81,7 +86,7 @@ Public/Commercial Cloud。
 | 部署/用量 | OpenAI/AIServices，非空 provider format；Standard/GlobalStandard/DataZoneStandard 及明确 Batch SKU 的 token 规则 | PTU capacity-hour、训练/hosting、秒数/图片数等全计费族计量 |
 | 模态/档位 | 已有适用 token 单价的文本/音频/图像变体、priority/flex/Batch；条件不足时估算区间 | 未测量模态、服务档位、缓存等条件的唯一实际账单 |
 | 价格 | 官方 Azure OpenAI USD 零售价；手动文本 token 缺价规则 | 自动获取 Grok/其他 provider 价格、EA/CSP/MCA 成交价、实际账单 |
-| cache | 普通 input 保守策略；已知写入不重复计价，未知写入纳入估算上限 | 从现有聚合指标自动还原所有 cached-token 精确折扣 |
+| cache | 有命中率时按比例推算缓存读取并匹配单价；未知写入只替换非缓存输入计入上限 | 从平均比例还原精确 cached token 或真实各档位缓存分布 |
 | 告警对象 | 合作伙伴统一运维收件人 | 客户收件人、每租户邮件模板 |
 | 历史 | 费用 10 天、价格 90 天 | 无限期历史 |
 | 授权 | 订阅级 Lighthouse template | 资源组委派、多租户 Entra 应用主路径 |
@@ -584,15 +589,21 @@ kind/SKU/指标契约之外保留明确异常，不盲目试算；已有协议�
 
 ### 3.5 cached input 和第一阶段估算策略
 
-Azure Monitor 聚合 prompt-token 指标不能保证拆出所有模型的 cache-hit token，而 cached
-input 可能具有更低单价。第一阶段采用明确的保守策略：
+Azure Monitor 聚合 prompt-token 指标不能拆出本 GPT 部署的精确 cache-hit token。
+按 2026-11-11 用户明确选择，version 4 使用 `cache-ratio-retail-range`：
 
-- 所有无法区分的 cached input token 均按普通 input 单价计算；
-- 历史小时可为 `cached-input-at-standard-rate`，rule version 3 新小时采用
-  `model-independent-retail-range`，仍保留普通输入保守 cache-read 策略；
-- GUI/邮件显示零售价估算、上下界及理由，不是实际账单上下界；未知缓存写入纳入上限，
-  已知写入替换对应普通 input，不重复收费；
-- 后续若 Azure 指标提供稳定的 cache 维度，可通过计量适配器增加精确规则。
+- 有效 OpenAI `Percent/Average` 命中率为 `p` 时，估算缓存读取 `C = I × p / 100`，
+  非缓存输入 `N = I - C`；中间保留小数，不将比例推算量伪装成整数实测计数。
+- 每个实际响应档位沿用同一部署比例，再分别匹配该档位、上下文、区域、版本的普通输入/
+  cached-input 单价。没有按档位拆分的缓存指标，此分配是明确假设，不是观测事实。
+- 比例缺失、读取失败或不适用时不推断零缓存；仍保留普通输入估算。正缓存量缺少
+  对应缓存单价时，只保存已知小计、上限未知及 `CACHE_READ_PRICE_MISSING`，不借用其他档位价格。
+- 未知写入只在 `N` 内替换普通 input 价格，不在已收取 input 费用上再加一遍完整 write 价格。
+  GUI/邮件的区间受比例假设及缺失维度影响，不是实际账单上下界。
+- `cacheReadEstimate` 独立保存方法、比例、估算读取/非缓存数量及同比分档假设；
+  原 `billingTelemetry.cache.readTokens` 仍为 null，不伪造 Monitor 精确计数。
+- 已保存 version 1–3 小时和已知历史金额不自动重算。手动缺价规则仍是统一输入/输出
+  简化价，不虚构其未配置的缓存折扣。完整精确计价仍需请求级 usage 元数据。
 
 #### 3.5.1 官网核实的缓存/priority 指标与当前边界（2026-11-06）
 
@@ -600,7 +611,7 @@ input 可能具有更低单价。第一阶段采用明确的保守策略：
 | --- | --- | --- | --- |
 | Models 主输入/输出 | `InputTokens` / `OutputTokens` | Count / Total | 主总量不变，不与补充指标相加 |
 | OpenAI 实际 priority 档位 | `ProcessedPromptTokens` / `GeneratedTokens` 的 `ServiceTierResponse` | Count / Total | 能力发现支持且同小时总量核对通过后，用实际档位匹配现有 priority/standard/flex 单价 |
-| OpenAI 缓存命中率 | `AzureOpenAIContextTokensCacheMatchRate` | Percent / Average | 查询部署/模型/版本分组；保留 Azure 返回的小时平均百分比，不乘小时 token 推算精确缓存量 |
+| OpenAI 缓存命中率 | `AzureOpenAIContextTokensCacheMatchRate` | Percent / Average | 保留小时平均百分比；version 4 按用户选择乘输入量推算缓存读取，明确不是精确数量 |
 | Anthropic 缓存读取 | `cacheReadInputTokens` | Count / Total | 只对 Anthropic format 保存独立数量，不当作通用 OpenAI 缓存指标 |
 | Anthropic 缓存写入 | `ephemeral5mInputTokens` / `ephemeral1hInputTokens` | Count / Total | 保留 5 分钟/1 小时 TTL 的各自计数，不并入未经确认的 OpenAI 写入扣减公式 |
 | PTU Active Tokens | `ActiveTokens` | Count | 官网限定 PTU/PTU-managed；本按量计价不拿它反推 PAYG 缓存量 |
@@ -621,6 +632,63 @@ Anthropic 缓存计数存在、缺失或无法确认 TTL 费用时，现有单�
 缓存独有用量也不能变成完整零费用。该改动不新增 Anthropic 或其他 provider 官方价格。
 现有租户 USD/小时阈值包含已匹配的 priority 费用；不是新加独立 token 数阈值。
 费用恢复不发邮件的策略不变。
+
+#### 3.5.2 双费用估算与固定上下文参考
+
+2026-11-13 源码规则 version 5 使用 `equal-context-retail-range`。本地参考的每个实际
+档位、输入/输出方向按 token 数量各半匹配短/长上下文价格；原始 `billingSlices`
+仍保留真实观测，不把参考假设写回指标。`contextMixEstimate` 记录方法和 0.5/0.5 权重。
+统一上下文单价在两种分配下金额不变；缺少某一半的适用价格仍显式保留缺价。
+
+缓存读取继续使用部署小时比例，已知写入在两种上下文各半分配并替换非缓存普通输入；
+未知写入及其他维度不足可保留明细区间。参考基准不是原上下限的简单中点，也不是账单。
+`knownCostUsd` 仍为告警比较来源；另一个原生估算不会静默切换告警策略。
+
+`FoundryModelEstimatedCost` 通过同一受限 ARM 客户端读取 `Total` / `PT1H`，按部署、
+模型与版本核对。API Unit 为 `Unspecified`，金额按 USD 处理；原生金额解析允许有限
+非负小数，token 解析仍要求安全整数。能力缓存升级为 version 2，保留 version 1
+可读性，并对旧缓存重新发现新指标。
+
+可选 `foundryEstimatedCost` 在部署和小时保存指标名、币种、金额、读取时间、状态和问题。
+原生完整金额必须覆盖相关部署与授权订阅；无数据、不支持、失败或部分覆盖保持 null，
+不使用本地参考金额兜底。原生读取失败在独立状态、问题和运行警告中显示，不抹掉本地计价。
+GUI 用浅蓝虚线绘制参考、深蓝实线绘制原生费用，展示两种方法与原生覆盖数。
+
+历史补齐只针对明确的已完成保留小时，复用同一价格计算器和原官方 snapshot。
+受控 `backfillContextEstimates` 备份原日文件字节、ETag 与目标租户的旧缓存行，
+条件提交费用与视图，保留采集时间、用量/档位、阈值、确认状态及非目标小时。
+准备/完成审计支持中断恢复，不重放告警；原缺价修复 API 的限制不放宽。
+
+原生指标的官方描述仍是费用估算，不是 invoice 或 billed charge。2026-11-12 MCT
+两小时的原生值为 USD 2.8557566 和 0.606792，合计 3.4625486，与该批响应 usage
+零售价核算一致；此观察不构成所有模型、cache/Priority 分支或合同账单精度保证。
+
+##### 缓存写入费用与指标
+
+GPT-5.6 及后续系列可能收取缓存写入费，写入费率还可能受 TTL 影响；更早模型的缓存写入
+没有额外费用。不能对全部模型硬编码一个 write 倍数，应引用当时生效的官方 Cache Write
+meter，TTL/上下文不明确时保留候选价格区间。
+
+对一个档位且匹配确定单价的分组，设输入 `I`、输出 `O`、比例估算读取 `C`、已知写入 `W`，
+各单价均为 USD/百万 token：
+
+```text
+N = I - C
+费用 = ((N - W) × 普通输入价 + C × 缓存读取价
+        + W × 缓存写入价 + O × 输出价) / 1000000
+未知 W 时，在 0 ≤ W ≤ N 内求估算区间，不把写入价与普通输入价重复相加。
+```
+
+当前直连 GPT 部署没有适用的精确 cache-write Monitor counter。准确写入量来自
+Chat Completions 响应 `usage.prompt_tokens_details.cache_write_tokens`，准确读取量为同级
+`cached_tokens`。Anthropic 的 `ephemeral5mInputTokens/ephemeral1hInputTokens` 只适用于
+该 provider，`ModelRouterCachedTokens` 只适用于 Model Router，均不能替代直连 GPT 的指标。
+当前平台不采集响应正文，也未增加调用方 usage 接入。
+
+本次 MCT 实测小时说明了估算误差：输入 7,034、平均比例 `0.8065233094404624%`，
+按本策略推算读取约 56.7308 token；调用响应实际读取 2,903、写入 2,903。
+两者不能混称“准确缓存量”。这次响应 usage 和当时短上下文价格核算的零售价估算为
+USD 3.0718408，不是最终账单，也不用于覆盖原 Monitor 小时记录。
 
 官方依据（核对日期 2026-11-06）：
 [监控指标参考](https://learn.microsoft.com/azure/foundry/openai/monitor-openai-reference)、
@@ -726,13 +794,13 @@ TenantEstimateUsd   = 0.216 + 0.288 = 0.504
 | 例如读到的值 | `60` 表示小时平均 60% | `7000` 表示对应模型缓存读取 7,000 token |
 | 适用范围 | OpenAI，按实际能力发现确认 | Anthropic 专属，不能用于 OpenAI |
 
-OpenAI 命中率仅按部署/模型/版本分组，没有 `ServiceTierResponse` 维度。因此不能把
-上面的 Priority 输入 40,000 × 60% 当成 24,000 个 Priority cached token。百分比也不是
-精确 token 数；即便知道整个部署的缓存比例，仍不知道 Standard/Priority 各自缓存多少。
+OpenAI 命中率仅按部署/模型/版本分组，没有 `ServiceTierResponse` 维度。version 4
+按用户选择，允许把上面的 Priority 输入 40,000 × 60% 作为 24,000 个缓存读取 token 的
+估算假设；不能称为实测值，也不能据此声称知道 Standard/Priority 各自真实缓存分布。
 
 当前 OpenAI `PriorityInputTokens` 是**未进行缓存拆分的输入计数**，不是已确认全部未命中
-缓存的数量。代码不获取或估算其中精确 cached/uncached 数量，费用暂不扣无法确认的
-缓存折扣；这可能高于实际账单。准确拆分需要另行接入每次响应的实际 `service_tier`、
+缓存的数量。version 4 拆分比例估算的 cached/uncached 后匹配各自单价；比例无效时不打折。
+准确拆分仍需要另行接入每次响应的实际 `service_tier`、
 输入总量、`cached_tokens` 和适用的缓存写入数量，并验证相应计价规则。
 
 如果指标不存在、读取失败、返回不一致，程序明确标记未知/问题并保留主总量，不凭空
@@ -886,7 +954,8 @@ Astra、5.6-Sol 不再因名称或版本未列入名单而拒绝计价。完全�
 Monitor 分组如有上下文、模态或实际响应服务档位，则按每组 token 计价；所有分组数量
 必须精确等于部署小时总量，不把小时累计输入误当作单次请求上下文。维度不足时保存
 `costUsd/costUpperUsd`、`pricingUncertainty`，小时保存 `knownCostUsd/knownCostUpperUsd`。
-缓存输入仍按普通输入保守估算；未知写入纳入上限，已计量写入替换对应输入、不重复收费。
+version 4 有效命中率按比例拆分缓存读取；无比例时保留普通输入估算。未知写入仅在
+非缓存输入中替换价格形成区间，已计量写入也不重复收取对应普通输入费用。
 
 - 详情、趋势、邮件显示同一估算区间；未知上限明确标记“上限未知”。
 - 已知估算下限超过原阈值才超限；新的完整小时上限也在阈值内才内部恢复，不发费用恢复邮件。

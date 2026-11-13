@@ -34,10 +34,13 @@ const ranged: HourlyUsage = {
       price(3, 'input', 'long', '4.680713'), price(4, 'output', 'long', '12')],
   }],
 }
-async function fixture(page: Page, hour: HourlyUsage) {
+async function fixture(page: Page, hour: HourlyUsage, next?: HourlyUsage) {
+  await page.route('**/api/v1/session', (route) => route.fulfill({
+    json: { objectId: 'fixture', name: 'Local billing verification', authMode: 'development' },
+  }))
   await page.route(`**/api/v1/tenants/${id}`, (route) => route.fulfill({ json: { tenant } }))
   await page.route(`**/api/v1/tenants/${id}/usage?*`, (route) => route.fulfill({
-    json: { tenantId: id, hours: [hour], inventory: null, latestRun: null },
+    json: { tenantId: id, hours: next ? [hour, next] : [hour], inventory: null, latestRun: null },
   }))
   await page.route(`**/api/v1/tenants/${id}/alerts`, (route) => route.fulfill({ json: { items: [{
     schemaVersion: 1, id: 'a'.repeat(64), key: 'local-reprice-test', kind: 'cost-exceeded', subject: `tenant-${id}`,
@@ -149,7 +152,41 @@ test('provider-specific cache quantities and unavailable cache measurements are 
   await expect(page.locator('.usage-summary-grid').locator('article').first()).toContainText('—')
 })
 
-test('range amounts and price references fit desktop and tablet widths without horizontal page overflow', async ({ page }) => {
+test('ratio-derived cache reads and prices are clearly estimates while write quantities remain unknown', async ({ page }) => {
+  const hour: HourlyUsage = {
+    ...ranged, knownCostUsd: '15.55', knownCostUpperUsd: '15.925', estimatedCostUsd: '15.55',
+    pricingRuleVersion: 4, estimatePolicy: 'cache-ratio-retail-range',
+    breakdown: [{
+      ...ranged.breakdown[0]!, costUsd: '15.55', costUpperUsd: '15.925', pricingStatus: 'range',
+      pricingUncertainty: ['cacheRead', 'cacheWrite'],
+      cacheReadEstimate: { method: 'hourly-match-rate', matchRatePercent: '25',
+        estimatedReadTokens: '250000', estimatedNonCachedInputTokens: '750000', tierAllocation: 'same-ratio-per-tier' },
+      billingTelemetry: { tierSource: 'models', cache: { source: 'openai-cache-match-rate',
+        status: 'available', matchRatePercent: '25', readTokens: null, write5mTokens: null, write1hTokens: null } },
+      prices: [{ ...price(1, 'input', 'short', '2'), bound: 'both' },
+        { ...price(2, 'output', 'short', '7'), bound: 'both' },
+        { ...price(3, 'input', 'short', '0.2'), direction: 'cachedInput', bound: 'both' },
+        { ...price(4, 'input', 'short', '2.5'), direction: 'cacheWrite', bound: 'upper' }],
+    }],
+  }
+  await fixture(page, hour)
+  await page.goto(`/tenants/${id}/usage`)
+  const selected = page.getByRole('region', { name: '所选小时费用', exact: true })
+  await expect(page.locator('.usage-summary-grid')).toContainText('US$15.55–US$15.925')
+  await expect(page.locator('.usage-notice')).toContainText('按小时比例估算缓存读取并匹配单价')
+  await expect(page.locator('.usage-notice')).not.toContainText('不折算折扣')
+  await expect(page.locator('.usage-notice')).toContainText('历史口径以小时明细为准')
+  await expect(selected.locator('dl div').filter({ hasText: '缓存读取 token（比例估算）' })).toContainText('250,000')
+  await expect(selected.locator('dl div').filter({ hasText: '非缓存输入 token（比例估算）' })).toContainText('750,000')
+  await expect(selected).toContainText('不代表各档位的真实缓存分布')
+  await expect(selected).toContainText('cache_write_tokens')
+  await expect(selected).toContainText('不与普通输入重复收费')
+  await expect(selected).toContainText('缓存读取 · Standard（标准） · 短上下文：US$0.20')
+  await expect(selected).toContainText('缓存写入 · Standard（标准） · 短上下文：US$2.50')
+  await expect(selected).not.toContainText('该小时未应用缓存比例估算')
+})
+
+test('range amounts and price references fit desktop and tablet widths without horizontal page overflow', async ({ page }, testInfo) => {
   await fixture(page, ranged)
   await page.goto(`/tenants/${id}/usage`)
   await page.waitForLoadState('networkidle')
@@ -158,8 +195,47 @@ test('range amounts and price references fit desktop and tablet widths without h
     const dimensions = await page.evaluate(() => ({ visible: innerWidth, document: document.documentElement.scrollWidth }))
     expect(dimensions.document).toBeLessThanOrEqual(dimensions.visible + 1)
     await page.screenshot({
-      path: `/home/chx/.copilot/session-state/26f4dc38-7cdf-483b-a7fa-b2bdae3c98e0/files/generic-billing-ui-${width}.png`,
+      path: testInfo.outputPath(`generic-billing-ui-${width}.png`),
       fullPage: true,
     })
   }
+})
+
+test('dual estimates draw the weighted reference dashed and native USD solid, with independent values', async ({ page }) => {
+  const estimate = { metricName: 'FoundryModelEstimatedCost' as const, currency: 'USD' as const,
+    status: 'available' as const, costUsd: '16.739502000000', retrievedAtUtc: ranged.collectedAtUtc, issue: null }
+  const hour: HourlyUsage = {
+    ...ranged, pricingRuleVersion: 5, estimatePolicy: 'equal-context-retail-range',
+    knownCostUsd: '22.710107500000', estimatedCostUsd: '22.710107500000', knownCostUpperUsd: '22.710107500000',
+    foundryEstimatedCost: estimate,
+    breakdown: [{ ...ranged.breakdown[0]!, costUsd: '22.710107500000', costUpperUsd: '22.710107500000',
+      contextMixEstimate: { method: 'equal-short-long', basis: 'tokens', shortWeight: '0.5', longWeight: '0.5' },
+      foundryEstimatedCost: estimate }],
+  }
+  await fixture(page, hour, { ...hour, windowStartUtc: hour.windowEndUtc, windowEndUtc: '2026-10-06T03:00:00.000Z' })
+  await page.goto(`/tenants/${id}/usage`)
+  await page.waitForLoadState('networkidle')
+  const chart = page.locator('.usage-chart')
+  await expect(chart.locator('[stroke="#479ef5"][stroke-dasharray="3 3"]')).not.toHaveCount(0)
+  await expect(chart.locator('[stroke="#0f6cbd"]')).not.toHaveCount(0)
+  await expect(chart).toContainText('本地参考估算')
+  await expect(chart).toContainText('Azure 原生估算')
+  await expect(page.locator('.usage-summary-grid')).toContainText('US$22.7101')
+  await expect(page.locator('.usage-summary-grid')).toContainText('US$16.7395')
+  await expect(page.getByRole('region', { name: '所选小时费用', exact: true })).toContainText('50/50 上下文参考')
+  await expect(page.getByText('原生费用覆盖 2/2 个已记录小时；未取得的小时不按零金额累加。', { exact: true })).toBeVisible()
+})
+
+test('missing native metrics stay empty instead of using a zero or the reference amount', async ({ page }) => {
+  const hour: HourlyUsage = {
+    ...ranged, pricingRuleVersion: 5, estimatePolicy: 'equal-context-retail-range',
+    foundryEstimatedCost: { metricName: 'FoundryModelEstimatedCost', currency: 'USD', status: 'noData',
+      costUsd: null, retrievedAtUtc: ranged.collectedAtUtc, issue: null },
+  }
+  await fixture(page, hour, { ...hour, windowStartUtc: hour.windowEndUtc, windowEndUtc: '2026-10-06T03:00:00.000Z' })
+  await page.goto(`/tenants/${id}/usage`)
+  const nativeCard = page.locator('.usage-summary-grid article').filter({ hasText: '所选小时 Azure 原生估算' })
+  await expect(nativeCard.locator('strong')).toHaveText('—')
+  await expect(page.locator('.usage-chart [stroke="#0f6cbd"]')).toHaveCount(0)
+  await expect(page.getByRole('region', { name: '所选小时费用', exact: true })).toContainText('原生指标暂无数据')
 })
